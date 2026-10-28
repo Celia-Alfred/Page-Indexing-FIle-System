@@ -1,7 +1,6 @@
 
 import pymupdf
 
-
 def extract_pages(pdf_bytes: bytes) -> list[dict]:
     """Extract text and page numbers from a PDF."""
     pages = []

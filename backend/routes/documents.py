@@ -24,7 +24,6 @@ class QueryRequest(BaseModel):
     document_id: str | None = None
     top_k: int = Field(default=3, ge=1)
 
-
 @router.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     try:

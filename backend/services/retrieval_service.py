@@ -7,7 +7,6 @@ from database import (
 )
 from services.llm_service import understand_query
 
-
 def _normalize(text: str) -> str:
     """Normalize text for keyword matching."""
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()

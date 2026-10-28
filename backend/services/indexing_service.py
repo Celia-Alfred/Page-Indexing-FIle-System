@@ -9,7 +9,6 @@ from database import (
 from services.pdf_service import extract_pages
 from services.tree_service import build_page_index_tree
 
-
 def index_pdf(filename: str, pdf_bytes: bytes) -> dict:
     document_id = str(uuid4())
     extracted_pages = extract_pages(pdf_bytes)

@@ -3,7 +3,6 @@ import re
 
 from services.llm_service import generate_content_with_retry
 
-
 def generate_answer(
     question: str,
     retrieved_sections: list[dict],

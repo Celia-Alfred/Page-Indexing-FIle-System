@@ -1,7 +1,6 @@
 
 from services.llm_service import generate_summary
 
-
 def build_page_index_tree(
     document_id: str,
     filename: str,

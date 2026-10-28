@@ -49,7 +49,6 @@ def generate_content_with_retry(
             )
             time.sleep(delay)
 
-
 def generate_summary(text: str) -> str:
     """Generate a concise, document-grounded summary using Gemini."""
 
@@ -80,7 +79,6 @@ DOCUMENT SECTION:
         raise RuntimeError("Gemini returned an empty summary")
 
     return summary
-
 
 def understand_query(question: str) -> dict:
     """Analyze a question for hierarchical, vectorless retrieval."""
