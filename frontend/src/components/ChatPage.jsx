@@ -31,16 +31,20 @@ export default function ChatPage({
   const [asking, setAsking] = useState(false);
   const [expandedSources, setExpandedSources] = useState({});
   const [activeCitation, setActiveCitation] = useState(null);
+
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+    });
   }, [messages, asking]);
 
   async function askQuestion(event) {
     event.preventDefault();
 
     const questionText = question.trim();
+
     if (!questionText || asking) return;
 
     setMessages((previous) => [
@@ -50,6 +54,7 @@ export default function ChatPage({
 
     setQuestion("");
     setAsking(true);
+    setActiveCitation(null);
 
     try {
       const payload = {
@@ -63,7 +68,9 @@ export default function ChatPage({
 
       const response = await fetch(`${API_BASE}/documents/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       });
 
@@ -108,28 +115,31 @@ export default function ChatPage({
   }
 
   function getCitationId(citation, index) {
-    return String(
-      citation.source_id ||
-      citation.id ||
-      `S${index + 1}`
-    );
+    return String(citation.source_id || citation.id || `S${index + 1}`)
+      .replace(/^\[/, "")
+      .replace(/\]$/, "");
   }
 
   function getPageNumber(citation) {
     return citation.page_number ?? citation.page ?? null;
   }
 
-  function getDocumentId(citation) {
+  function getFilename(citation) {
     return (
-      citation.document_id ||
-      citation.documentId ||
-      ""
+      citation.filename ||
+      citation.file_name ||
+      citation.document_filename ||
+      "Source document"
     );
+  }
+
+  function getDocumentId(citation) {
+    return citation.document_id || citation.documentId || "";
   }
 
   function getDocumentForCitation(citation) {
     const documentId = getDocumentId(citation);
-    const filename = citation.filename || citation.file_name;
+    const filename = getFilename(citation);
 
     return documents.find((doc) => {
       const id = doc.document_id || doc.id || doc._id;
@@ -152,7 +162,6 @@ export default function ChatPage({
     if (document) {
       setSelectedDocument(document);
     }
-
   }
 
   function renderAnswer(text, citations = []) {
@@ -165,6 +174,7 @@ export default function ChatPage({
       ])
     );
 
+    // Match literal citations such as [S1], [S2], and [S10].
     const parts = text.split(/(\[S\d+\])/g);
 
     return parts.map((part, index) => {
@@ -177,24 +187,24 @@ export default function ChatPage({
       const citation = citationMap.get(match[1]);
 
       if (!citation) {
+        // Preserve unmatched citations rather than silently deleting them.
         return <span key={`unknown-${index}`}>{part}</span>;
       }
 
       const pageNumber = getPageNumber(citation);
+      const filename = getFilename(citation);
 
       return (
         <button
           key={`citation-${index}`}
           type="button"
           className="inline-citation"
-          title={
-            pageNumber
-              ? `View source details for page ${pageNumber}`
-              : "View source details"
-          }
+          title={`View ${filename}, page ${pageNumber ?? "unknown"}`}
           onClick={() => openCitation(citation, match[1])}
         >
-          {pageNumber ? `[Page ${pageNumber}]` : `[${match[1]}]`}
+          {pageNumber != null
+            ? `${filename} · p. ${pageNumber}`
+            : filename}
         </button>
       );
     });
@@ -211,9 +221,10 @@ export default function ChatPage({
     if (!citation) return null;
 
     const pageNumber = getPageNumber(citation);
-    const filename = citation.filename || citation.file_name;
+    const filename = getFilename(citation);
     const documentId = getDocumentId(citation);
     const document = getDocumentForCitation(citation);
+    const excerpt = citation.excerpt || citation.text || "";
 
     return (
       <div className="citation-detail-panel">
@@ -223,8 +234,12 @@ export default function ChatPage({
           </div>
 
           <div>
-            <strong>Source details</strong>
-            <span>{filename || "Referenced document"}</span>
+            <strong>{filename}</strong>
+            <span>
+              {pageNumber != null
+                ? `Page ${pageNumber} · Cited source excerpt`
+                : "Cited source excerpt"}
+            </span>
           </div>
 
           <button
@@ -238,25 +253,28 @@ export default function ChatPage({
         </div>
 
         <div className="citation-detail-meta">
-          {pageNumber != null && (
-            <span>Page {pageNumber}</span>
-          )}
+          {pageNumber != null && <span>Page {pageNumber}</span>}
 
           {citation.section_title && (
             <span>{citation.section_title}</span>
           )}
 
-          {citation.section && (
-            <span>{citation.section}</span>
-          )}
+          {citation.section && <span>{citation.section}</span>}
         </div>
 
-        {citation.excerpt && (
-          <div className="citation-excerpt">
-            <span className="citation-excerpt-label">Cited passage</span>
-            <p>{citation.excerpt}</p>
-          </div>
-        )}
+        <div className="citation-excerpt">
+          <span className="citation-excerpt-label">
+            Cited source excerpt
+          </span>
+
+          {excerpt ? (
+            <p>{excerpt}</p>
+          ) : (
+            <p className="citation-note">
+              No source excerpt was returned by the backend.
+            </p>
+          )}
+        </div>
 
         {document && (
           <button
@@ -275,14 +293,14 @@ export default function ChatPage({
 
         {!document && documentId && (
           <p className="citation-note">
-            The document is referenced by ID, but it isn't currently
-            available in the loaded document list.
+            This document is referenced by ID but is not available in
+            the currently loaded document list.
           </p>
         )}
 
-        {!pageNumber && (
+        {pageNumber == null && (
           <p className="citation-note">
-            The backend did not return a specific page number for this source.
+            The backend did not return a specific page number.
           </p>
         )}
       </div>
@@ -303,8 +321,8 @@ export default function ChatPage({
           </h2>
 
           <p>
-            Ask questions and get AI-generated answers grounded
-            in your indexed PDF content.
+            Ask questions and get AI-generated answers grounded in
+            your indexed PDF content.
           </p>
         </div>
       </section>
@@ -396,15 +414,24 @@ export default function ChatPage({
                   className="suggestion"
                   disabled={documents.length === 0}
                   onClick={() =>
-                    useSuggestion("Summarize the key points in this document.")
+                    useSuggestion(
+                      "Summarize the key points in this document."
+                    )
                   }
                 >
-                  <span><FileText size={17} /></span>
+                  <span>
+                    <FileText size={17} />
+                  </span>
+
                   <span className="suggestion-copy">
                     <strong>Summarize key points</strong>
                     <small>Get a concise overview</small>
                   </span>
-                  <ArrowUpRight size={16} className="suggestion-arrow" />
+
+                  <ArrowUpRight
+                    size={16}
+                    className="suggestion-arrow"
+                  />
                 </button>
 
                 <button
@@ -415,12 +442,19 @@ export default function ChatPage({
                     useSuggestion("What are the main topics covered?")
                   }
                 >
-                  <span><FileText size={17} /></span>
+                  <span>
+                    <FileText size={17} />
+                  </span>
+
                   <span className="suggestion-copy">
                     <strong>Explore topics</strong>
                     <small>Discover the main ideas</small>
                   </span>
-                  <ArrowUpRight size={16} className="suggestion-arrow" />
+
+                  <ArrowUpRight
+                    size={16}
+                    className="suggestion-arrow"
+                  />
                 </button>
               </div>
             </div>
@@ -444,8 +478,8 @@ export default function ChatPage({
                       {message.role === "user"
                         ? "You"
                         : message.role === "error"
-                        ? "Something went wrong"
-                        : "AI Assistant"}
+                          ? "Something went wrong"
+                          : "AI Assistant"}
                     </span>
 
                     <div className="message-bubble">
@@ -468,50 +502,59 @@ export default function ChatPage({
                             ) : (
                               <ChevronRight size={15} />
                             )}
+
                             <FileText size={14} />
                             Sources ({message.citations.length})
                           </button>
 
                           {expandedSources[index] && (
                             <div className="source-list">
-                              {message.citations.map((citation, citationIndex) => {
-                                const citationId = getCitationId(
-                                  citation,
-                                  citationIndex
-                                );
-                                const pageNumber = getPageNumber(citation);
+                              {message.citations.map(
+                                (citation, citationIndex) => {
+                                  const citationId = getCitationId(
+                                    citation,
+                                    citationIndex
+                                  );
 
-                                return (
-                                  <button
-                                    type="button"
-                                    className="source-card source-card-button"
-                                    key={`${citationId}-${citationIndex}`}
-                                    onClick={() =>
-                                      openCitation(citation, citationId)
-                                    }
-                                  >
-                                    <div className="source-file-icon">
-                                      <FileText size={17} />
-                                    </div>
+                                  const pageNumber =
+                                    getPageNumber(citation);
 
-                                    <div className="source-info">
-                                      <strong>
-                                        {citation.filename || "Source document"}
-                                      </strong>
-                                      <span>
-                                        {citation.section_title
-                                          ? `${citation.section_title} · `
-                                          : ""}
-                                        {pageNumber != null
-                                          ? `Page ${pageNumber}`
-                                          : "Page not specified"}
-                                      </span>
-                                    </div>
+                                  return (
+                                    <button
+                                      type="button"
+                                      className="source-card source-card-button"
+                                      key={`${citationId}-${citationIndex}`}
+                                      onClick={() =>
+                                        openCitation(
+                                          citation,
+                                          citationId
+                                        )
+                                      }
+                                    >
+                                      <div className="source-file-icon">
+                                        <FileText size={17} />
+                                      </div>
 
-                                    <ExternalLink size={14} />
-                                  </button>
-                                );
-                              })}
+                                      <div className="source-info">
+                                        <strong>
+                                          {getFilename(citation)}
+                                        </strong>
+
+                                        <span>
+                                          {citation.section_title
+                                            ? `${citation.section_title} · `
+                                            : ""}
+                                          {pageNumber != null
+                                            ? `p. ${pageNumber}`
+                                            : "Page not specified"}
+                                        </span>
+                                      </div>
+
+                                      <ExternalLink size={14} />
+                                    </button>
+                                  );
+                                }
+                              )}
                             </div>
                           )}
                         </div>
@@ -537,6 +580,7 @@ export default function ChatPage({
 
               <div className="message-content">
                 <span className="message-author">AI Assistant</span>
+
                 <div className="message-bubble thinking">
                   <LoaderCircle className="spin" size={17} />
                   <span>
@@ -563,7 +607,10 @@ export default function ChatPage({
             rows={2}
             disabled={asking || documents.length === 0}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey
+              ) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
@@ -579,7 +626,11 @@ export default function ChatPage({
             <button
               type="submit"
               className="send-button"
-              disabled={!question.trim() || asking || documents.length === 0}
+              disabled={
+                !question.trim() ||
+                asking ||
+                documents.length === 0
+              }
               aria-label="Send question"
               title="Send question"
             >
@@ -593,7 +644,8 @@ export default function ChatPage({
         </form>
 
         <p className="chat-disclaimer">
-          AI can make mistakes. Verify important information against the cited sources.
+          AI can make mistakes. Verify important information against
+          the cited sources.
         </p>
       </section>
     </div>
