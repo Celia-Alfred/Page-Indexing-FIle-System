@@ -10,6 +10,14 @@ MIN_COLUMN_GAP_RATIO = 0.12
 MIN_SIDE_BLOCKS = 2
 
 
+def _to_float_bbox(bbox):
+    """Convert a bounding box into JSON-safe float coordinates."""
+    if not bbox or len(bbox) < 4:
+        return [0.0, 0.0, 0.0, 0.0]
+
+    return [float(value) for value in bbox[:4]]
+
+
 def reconstruct_line_text(spans):
     """Reconstruct text from spans in horizontal reading order."""
     spans = sorted(
@@ -111,12 +119,15 @@ def _detect_columns(blocks, page_width):
     if largest_gap < page_width * MIN_COLUMN_GAP_RATIO:
         return None
 
-    divider = (centers[split_index] + centers[split_index + 1]) / 2
+    divider = (
+        centers[split_index] + centers[split_index + 1]
+    ) / 2
 
     left = [
         block for block in candidates
         if (_bbox(block)[0] + _bbox(block)[2]) / 2 < divider
     ]
+
     right = [
         block for block in candidates
         if (_bbox(block)[0] + _bbox(block)[2]) / 2 >= divider
@@ -241,8 +252,10 @@ def _sort_blocks_by_layout(blocks, page_width):
 
     if not separators:
         output = []
+
         for band in _group_vertical_bands(blocks):
             output.extend(_order_region(band, page_width))
+
         return output
 
     separators = [
@@ -290,16 +303,25 @@ def _sort_blocks_by_layout(blocks, page_width):
 
 
 def _extract_ordered_blocks(page, page_data):
-    """Extract text blocks with line, font, and bounding-box metadata."""
+    """
+    Extract text blocks with stable IDs, original block numbers,
+    line metadata, font metadata, and bounding boxes.
+    """
     raw_blocks = [
-        block
-        for block in page_data.get("blocks", [])
+        (raw_index, block)
+        for raw_index, block in enumerate(
+            page_data.get("blocks", [])
+        )
         if block.get("type", 0) == 0
     ]
 
     extracted = []
 
-    for block in raw_blocks:
+    for raw_index, block in raw_blocks:
+        block_no = int(block.get("number", raw_index))
+
+        block_id = f"page-{page.number + 1}-block-{block_no}"
+
         lines = []
 
         for line in block.get("lines", []):
@@ -311,14 +333,16 @@ def _extract_ordered_blocks(page, page_data):
 
             lines.append({
                 "text": text,
-                "bbox": line.get("bbox", []),
+                "bbox": _to_float_bbox(line.get("bbox", [])),
                 "spans": [
                     {
                         "text": span.get("text", ""),
                         "font": span.get("font", ""),
-                        "font_size": span.get("size", 0),
-                        "flags": span.get("flags", 0),
-                        "bbox": span.get("bbox", []),
+                        "font_size": float(span.get("size", 0)),
+                        "flags": int(span.get("flags", 0)),
+                        "bbox": _to_float_bbox(
+                            span.get("bbox", [])
+                        ),
                     }
                     for span in spans
                 ],
@@ -330,25 +354,94 @@ def _extract_ordered_blocks(page, page_data):
 
         if block_text:
             extracted.append({
-                "bbox": block.get("bbox", [0, 0, 0, 0]),
+                "block_id": block_id,
+                "block_no": block_no,
+                "bbox": _to_float_bbox(
+                    block.get("bbox", [0, 0, 0, 0])
+                ),
                 "lines": lines,
                 "text": block_text,
             })
 
-    return _sort_blocks_by_layout(extracted, page.rect.width)
+    return _sort_blocks_by_layout(
+        extracted,
+        page.rect.width,
+    )
+
+
+def _extract_word_coordinates(page):
+    """
+    Extract individual words and their original PDF page coordinates.
+
+    Coordinates use PyMuPDF's unrotated page coordinate system.
+    Each word receives the same block ID as its containing text block.
+    """
+    words = page.get_text("words", sort=False)
+    extracted_words = []
+
+    for word in words:
+        if len(word) < 8:
+            continue
+
+        (
+            x0,
+            y0,
+            x1,
+            y1,
+            text,
+            block_no,
+            line_no,
+            word_no,
+        ) = word[:8]
+
+        if not str(text).strip():
+            continue
+
+        block_no = int(block_no)
+
+        extracted_words.append({
+            "text": str(text),
+            "bbox": [
+                float(x0),
+                float(y0),
+                float(x1),
+                float(y1),
+            ],
+            "block_no": block_no,
+            "block_id": (
+                f"page-{page.number + 1}-block-{block_no}"
+            ),
+            "line_no": int(line_no),
+            "word_no": int(word_no),
+        })
+
+    return extracted_words
 
 
 def extract_pages(pdf_bytes):
-    """Extract text and layout metadata from each PDF page."""
+    """
+    Extract text, layout metadata, stable block IDs, and word
+    coordinates from every PDF page.
+    """
     pages = []
 
     with pymupdf.open(
         stream=io.BytesIO(pdf_bytes),
         filetype="pdf",
     ) as document:
+
         for index, page in enumerate(document):
             page_data = page.get_text("dict", sort=False)
-            blocks = _extract_ordered_blocks(page, page_data)
+
+            blocks = _extract_ordered_blocks(
+                page,
+                page_data,
+            )
+
+            page_width = float(page.cropbox.width)
+            page_height = float(page.cropbox.height)
+
+            words = _extract_word_coordinates(page)
 
             pages.append({
                 "page_number": index + 1,
@@ -356,6 +449,11 @@ def extract_pages(pdf_bytes):
                     block["text"] for block in blocks
                 ).strip(),
                 "blocks": blocks,
+                "words": words,
+                "page_width": page_width,
+                "page_height": page_height,
+                "page_rotation": int(page.rotation),
+                "coordinate_system": "pymupdf_unrotated",
             })
 
     return pages

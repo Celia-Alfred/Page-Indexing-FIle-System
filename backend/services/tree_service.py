@@ -4,32 +4,44 @@ import re
 from statistics import median
 from typing import Any
 
+
 from services.llm_service import generate_content_with_retry
 
 
+# These are processing safeguards, not assumptions about document type.
 MAX_BLOCK_CHARS = 700
 MAX_OUTLINE_CHARS = 28_000
 MAX_HEADING_WORDS = 24
+MAX_HEADING_CHARS = 180
 MIN_FONT_RATIO = 1.15
+MAX_HEADING_LEVEL = 6
 
+
+# ---------------------------------------------------------------------
+# Text and metadata helpers
+# ---------------------------------------------------------------------
 
 def _clean_text(value: Any) -> str:
     """Normalize whitespace without changing the meaning of the text."""
     if not isinstance(value, str):
         return ""
+
     return re.sub(r"\s+", " ", value).strip()
 
 
 def _get_block_text(block: dict) -> str:
     """Read text from the block structure produced by pdf_service.py."""
     text = _clean_text(block.get("text", ""))
+
     if text:
         return text
 
     parts = []
+
     for line in block.get("lines", []):
         if isinstance(line, dict):
             line_text = _clean_text(line.get("text", ""))
+
             if line_text:
                 parts.append(line_text)
 
@@ -37,7 +49,7 @@ def _get_block_text(block: dict) -> str:
 
 
 def _get_font_sizes(block: dict) -> list[float]:
-    """Support current and older span metadata field names."""
+    """Extract font sizes from span metadata."""
     sizes = []
 
     for line in block.get("lines", []):
@@ -62,7 +74,7 @@ def _get_font_sizes(block: dict) -> list[float]:
 
 
 def _is_bold(block: dict) -> bool:
-    """Inspect font names and PyMuPDF bold flags."""
+    """Check font names and PyMuPDF bold flags."""
     for line in block.get("lines", []):
         if not isinstance(line, dict):
             continue
@@ -78,24 +90,75 @@ def _is_bold(block: dict) -> bool:
             except (TypeError, ValueError):
                 flags = 0
 
-            # PyMuPDF uses bit 4 for bold.
             if "bold" in font_name or flags & 16:
                 return True
 
     return False
 
 
+def _get_bbox(block: dict) -> list[float] | None:
+    """Return a valid block bounding box when available."""
+    bbox = block.get("bbox")
+
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+
+    try:
+        values = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+
+    x0, y0, x1, y1 = values
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    return values
+
+
+def _position_key(record: dict) -> tuple[int, int]:
+    """Return the stable logical position used by the tree."""
+    return (
+        int(record["page_number"]),
+        int(record["block_index"]),
+    )
+
+
+def _outline_position(item: dict) -> tuple[int, int]:
+    return (
+        int(item["start_page"]),
+        int(item["start_block"]),
+    )
+
+
+# ---------------------------------------------------------------------
+# Document preparation
+# ---------------------------------------------------------------------
+
 def _prepare_document(
     pages: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     """
-    Flatten page blocks while preserving page and block indexes.
-    These positions allow the tree to assign text to sections precisely.
+    Flatten extracted page blocks without losing layout information.
+
+    block_index:
+        Position in the extracted page's blocks array. This is the
+        position used by the tree and by the outline validation.
+
+    block_no:
+        Original PyMuPDF block number, retained as metadata only.
+
+    bbox:
+        Original PDF coordinates. These help the outline model
+        understand columns and spatial relationships.
     """
     prepared_pages = []
     records = []
 
     for page_position, page in enumerate(pages):
+        if not isinstance(page, dict):
+            continue
+
         try:
             page_number = int(
                 page.get("page_number", page_position + 1)
@@ -103,32 +166,51 @@ def _prepare_document(
         except (TypeError, ValueError):
             page_number = page_position + 1
 
-        blocks = page.get("blocks", [])
-        if not isinstance(blocks, list):
-            blocks = []
+        page_width = page.get("page_width")
+        page_height = page.get("page_height")
+        page_rotation = page.get("page_rotation", 0)
 
         page_records = []
+        blocks = page.get("blocks", [])
+
+        if not isinstance(blocks, list):
+            blocks = []
 
         for block_index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
 
             text = _get_block_text(block)
+
             if not text:
                 continue
+
+            try:
+                block_no = int(block.get("block_no", block_index))
+            except (TypeError, ValueError):
+                block_no = block_index
 
             record = {
                 "page_number": page_number,
                 "block_index": block_index,
+                "block_no": block_no,
+                "block_id": block.get(
+                    "block_id",
+                    f"page-{page_number}-block-{block_no}",
+                ),
                 "text": text,
+                "bbox": _get_bbox(block),
                 "font_sizes": _get_font_sizes(block),
                 "bold": _is_bold(block),
+                "page_width": page_width,
+                "page_height": page_height,
+                "page_rotation": page_rotation,
             }
 
             page_records.append(record)
             records.append(record)
 
-        # Preserve text when block-level metadata is unavailable.
+        # Fallback for older extraction records without block data.
         if not page_records:
             page_text = _clean_text(page.get("text", ""))
 
@@ -136,36 +218,56 @@ def _prepare_document(
                 record = {
                     "page_number": page_number,
                     "block_index": 0,
+                    "block_no": 0,
+                    "block_id": f"page-{page_number}-block-0",
                     "text": page_text,
+                    "bbox": None,
                     "font_sizes": [],
                     "bold": False,
+                    "page_width": page_width,
+                    "page_height": page_height,
+                    "page_rotation": page_rotation,
                 }
+
                 page_records.append(record)
                 records.append(record)
 
         prepared_pages.append({
             "page_number": page_number,
+            "page_width": page_width,
+            "page_height": page_height,
+            "page_rotation": page_rotation,
             "records": page_records,
         })
+
+    prepared_pages.sort(key=lambda item: item["page_number"])
+    records.sort(key=_position_key)
 
     return prepared_pages, records
 
 
+# ---------------------------------------------------------------------
+# Heading detection
+# ---------------------------------------------------------------------
+
 def _looks_like_heading(text: str) -> bool:
-    """Conservative local heading detector used as a fallback."""
+    """Conservative heading detector for fallback outline generation."""
     text = _clean_text(text)
 
-    if not text or len(text) > 180:
+    if not text or len(text) > MAX_HEADING_CHARS:
         return False
 
     words = text.split()
+
     if not words or len(words) > MAX_HEADING_WORDS:
         return False
 
-    if text.endswith((".", ",", ";", "?", "!")):
+    if text.endswith((".", ",", ";", "?", "!", ":")):
         return False
 
-    if "://" in text or "www." in text.lower():
+    lowered = text.casefold()
+
+    if "://" in lowered or "www." in lowered:
         return False
 
     if re.fullmatch(r"[\d\s.,:%/()\-]+", text):
@@ -173,8 +275,11 @@ def _looks_like_heading(text: str) -> bool:
 
     numbered = bool(
         re.match(
-            r"^(?:\d+(?:\.\d+)*[.)]?|[A-Z][.)]|"
-            r"[IVXLCDM]+[.)])\s+\S",
+            r"^(?:"
+            r"\d+(?:\.\d+)*[.)]?"
+            r"|[A-Z][.)]"
+            r"|[IVXLCDM]+[.)]"
+            r")\s+\S",
             text,
         )
     )
@@ -187,19 +292,48 @@ def _looks_like_heading(text: str) -> bool:
     return numbered or uppercase
 
 
+def _detect_heading_level(text: str) -> int:
+    """Estimate hierarchy level from common numbering patterns."""
+    text = _clean_text(text)
+
+    decimal_match = re.match(
+        r"^(\d+(?:\.\d+)+)",
+        text,
+    )
+
+    if decimal_match:
+        return min(
+            decimal_match.group(1).count(".") + 1,
+            MAX_HEADING_LEVEL,
+        )
+
+    if re.match(r"^\d+[.)]\s+", text):
+        return 1
+
+    if re.match(r"^[IVXLCDM]+[.)]\s+", text):
+        return 1
+
+    if re.match(r"^[A-Z][.)]\s+", text):
+        return 2
+
+    return 1
+
+
 def _fallback_outline(records: list[dict]) -> list[dict]:
     """
-    Infer a conservative outline from numbering and formatting when
-    Gemini outline inference is unavailable.
+    Build a conservative outline when AI inference is unavailable.
+
+    The fallback uses numbering, font size, and bold formatting.
+    It does not assume a particular document type.
     """
     sizes = [
         size
         for record in records
-        for size in record["font_sizes"]
+        for size in record.get("font_sizes", [])
         if size > 0
     ]
-    typical_size = median(sizes) if sizes else 0
 
+    typical_size = median(sizes) if sizes else 0
     outline = []
 
     for record in records:
@@ -207,21 +341,24 @@ def _fallback_outline(records: list[dict]) -> list[dict]:
 
         numbered = bool(
             re.match(
-                r"^(?:\d+(?:\.\d+)*[.)]?|[A-Z][.)]|"
-                r"[IVXLCDM]+[.)])\s+\S",
+                r"^(?:"
+                r"\d+(?:\.\d+)*[.)]?"
+                r"|[A-Z][.)]"
+                r"|[IVXLCDM]+[.)]"
+                r")\s+\S",
                 text,
             )
         )
 
         larger_font = (
             typical_size > 0
-            and record["font_sizes"]
+            and record.get("font_sizes")
             and max(record["font_sizes"])
             >= typical_size * MIN_FONT_RATIO
         )
 
         short_bold = (
-            record["bold"]
+            record.get("bold", False)
             and len(text.split()) <= 12
             and not text.endswith((".", ",", ";", "?", "!"))
         )
@@ -231,30 +368,15 @@ def _fallback_outline(records: list[dict]) -> list[dict]:
             or (
                 larger_font
                 and len(text.split()) <= MAX_HEADING_WORDS
+                and len(text) <= MAX_HEADING_CHARS
             )
             or short_bold
         ):
             continue
 
-        level = 1
-
-        decimal_match = re.match(r"^(\d+(?:\.\d+)+)", text)
-
-        if decimal_match:
-            level = min(
-                decimal_match.group(1).count(".") + 1,
-                6,
-            )
-        elif re.match(r"^\d+[.)]\s+", text):
-            level = 1
-        elif re.match(r"^[A-Z][.)]\s+", text):
-            level = 2
-        elif re.match(r"^[IVXLCDM]+[.)]\s+", text):
-            level = 1
-
         outline.append({
             "title": text,
-            "level": level,
+            "level": _detect_heading_level(text),
             "start_page": record["page_number"],
             "start_block": record["block_index"],
         })
@@ -263,27 +385,39 @@ def _fallback_outline(records: list[dict]) -> list[dict]:
 
 
 def _deduplicate_outline(outline: list[dict]) -> list[dict]:
-    """Remove duplicate headings at the same position and adjacent repeats."""
+    """Validate, sort, and remove duplicate outline entries."""
     result = []
-    seen_at_position = set()
+    seen_positions = set()
 
     for item in outline:
-        title = _clean_text(item.get("title", ""))
-        if not title:
+        if not isinstance(item, dict):
             continue
 
+        title = _clean_text(item.get("title", ""))
+
         try:
-            page = int(item.get("start_page", 1))
-            block = int(item.get("start_block", 0))
-            level = max(1, min(int(item.get("level", 1)), 6))
+            page = int(item.get("start_page"))
+            block = int(item.get("start_block"))
+            level = int(item.get("level", 1))
         except (TypeError, ValueError):
             continue
 
-        key = (page, block, title.casefold())
-        if key in seen_at_position:
+        if (
+            not title
+            or len(title) > MAX_HEADING_CHARS
+            or len(title.split()) > MAX_HEADING_WORDS
+            or page < 1
+            or block < 0
+            or not 1 <= level <= MAX_HEADING_LEVEL
+        ):
             continue
 
-        seen_at_position.add(key)
+        key = (page, block, title.casefold())
+
+        if key in seen_positions:
+            continue
+
+        seen_positions.add(key)
 
         result.append({
             "title": title,
@@ -292,12 +426,7 @@ def _deduplicate_outline(outline: list[dict]) -> list[dict]:
             "start_block": block,
         })
 
-    result.sort(
-        key=lambda item: (
-            item["start_page"],
-            item["start_block"],
-        )
-    )
+    result.sort(key=_outline_position)
 
     deduplicated = []
 
@@ -314,15 +443,44 @@ def _deduplicate_outline(outline: list[dict]) -> list[dict]:
     return deduplicated
 
 
+# ---------------------------------------------------------------------
+# AI-assisted outline inference
+# ---------------------------------------------------------------------
+
 def _create_outline_prompt(records: list[dict]) -> str:
-    """Prepare document evidence for Gemini without fixed heading templates."""
+    """
+    Give Gemini text and layout evidence.
+
+    Coordinates are supplied as evidence, not as absolute rules.
+    The model must return positions that exist in the supplied records.
+    """
     lines = []
 
     for record in records:
         text = record["text"][:MAX_BLOCK_CHARS]
+
         metadata = []
 
-        if record["font_sizes"]:
+        bbox = record.get("bbox")
+
+        if bbox:
+            x0, y0, x1, y1 = bbox
+            metadata.append(
+                f"bbox=({x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f})"
+            )
+
+        if record.get("page_width") and record.get("page_height"):
+            metadata.append(
+                "page_size="
+                f"({record['page_width']},{record['page_height']})"
+            )
+
+        if record.get("page_rotation"):
+            metadata.append(
+                f"rotation={record['page_rotation']}"
+            )
+
+        if record.get("font_sizes"):
             metadata.append(
                 "font_sizes="
                 + ",".join(
@@ -331,17 +489,17 @@ def _create_outline_prompt(records: list[dict]) -> str:
                 )
             )
 
-        if record["bold"]:
+        if record.get("bold"):
             metadata.append("bold=true")
 
         metadata_text = (
-            f" [{', '.join(metadata)}]" if metadata else ""
+            f" [{'; '.join(metadata)}]" if metadata else ""
         )
 
         lines.append(
-            f'PAGE {record["page_number"]}, '
-            f'BLOCK {record["block_index"]}'
-            f'{metadata_text}: {text}'
+            f"PAGE {record['page_number']}, "
+            f"BLOCK {record['block_index']}"
+            f"{metadata_text}: {text}"
         )
 
     evidence = "\n".join(lines)
@@ -349,35 +507,62 @@ def _create_outline_prompt(records: list[dict]) -> str:
     if len(evidence) > MAX_OUTLINE_CHARS:
         evidence = (
             evidence[:MAX_OUTLINE_CHARS]
-            + "\n[Further document content omitted from this request.]"
+            + "\n[Additional document content omitted.]"
         )
 
     return f"""
-You are identifying the actual hierarchical structure of a PDF document.
+You are identifying the actual hierarchical structure of a PDF.
 
-Infer the structure from the supplied evidence. Do not assume that the
-document is a research paper, book, report, manual, or any specific type.
+Infer the document structure from the supplied text and layout evidence.
 
-Identify only headings supported by the text or formatting evidence.
-Preserve the document's own heading wording. Do not invent section names.
+Do not assume that the document is a research paper, book, report,
+manual, presentation, or any other specific document type.
 
-Rules:
-- Identify genuine titles, chapters, sections, and subsections.
-- Level 1 is a top-level section; level 2 is its child, and so on.
-- Consider numbering, typography, capitalization, wording, and context.
-- A table or figure caption, running header, footer, author name,
-  reference entry, or ordinary sentence is not automatically a heading.
-- Do not create a heading just because a page starts with a sentence.
-- Do not assume every page is a separate section.
-- If no reliable headings exist, return an empty headings list.
-- Every heading must refer to an exact PAGE and BLOCK in the evidence.
-- Return headings in reading order.
-- Do not generate summaries or page ranges; these are handled separately.
-- Return valid JSON only.
+GENERAL RULES:
 
-Required JSON schema:
+1. Identify genuine document titles, chapters, sections,
+   subsections, and other meaningful structural headings.
+
+2. Preserve the exact wording of headings.
+
+3. Do not invent headings or section names.
+
+4. Use levels consistently:
+   level 1 = top-level heading,
+   level 2 = subsection,
+   level 3 = subsection of level 2, and so on.
+
+5. Consider numbering, font size, bold formatting, capitalization,
+   wording, surrounding text, and spatial position.
+
+6. A paragraph, sentence, caption, table entry, reference entry,
+   author name, running header, or footer is not automatically
+   a heading.
+
+7. Do not mistake a page boundary for a section boundary.
+
+8. Documents may have multiple columns. Use bounding boxes to
+   understand the layout. Blocks at similar vertical positions
+   in different columns may belong to different sections.
+
+9. Do not infer reading order from vertical position alone.
+
+10. If a heading is part of a larger block, only return it as a
+    heading if that block can be represented by an exact supplied
+    block position. Do not invent a position.
+
+11. Every heading must match an exact PAGE and BLOCK in the evidence.
+
+12. Return headings in their best logical document order.
+
+13. If the document has no reliable headings, return an empty list.
+
+14. Return valid JSON only. Do not include Markdown fences.
+
+Return this JSON structure:
+
 {{
-  "document_title": "title supported by the document, or empty string",
+  "document_title": "document title supported by the evidence",
   "headings": [
     {{
       "title": "exact heading text",
@@ -389,6 +574,7 @@ Required JSON schema:
 }}
 
 DOCUMENT EVIDENCE:
+
 {evidence}
 """
 
@@ -406,6 +592,7 @@ def _infer_outline(
     )
 
     raw = (response.text or "").strip()
+
     if not raw:
         raise RuntimeError("Gemini returned an empty document outline")
 
@@ -424,13 +611,14 @@ def _infer_outline(
     document_title = _clean_text(
         result.get("document_title", "")
     )
+
     headings = result.get("headings", [])
 
     if not isinstance(headings, list):
         raise RuntimeError("Gemini returned an invalid headings list")
 
     valid_positions = {
-        (record["page_number"], record["block_index"])
+        _position_key(record)
         for record in records
     }
 
@@ -451,8 +639,9 @@ def _infer_outline(
 
         if (
             not title
+            or len(title) > MAX_HEADING_CHARS
             or len(title.split()) > MAX_HEADING_WORDS
-            or not 1 <= level <= 6
+            or not 1 <= level <= MAX_HEADING_LEVEL
             or (page, block) not in valid_positions
         ):
             continue
@@ -467,16 +656,20 @@ def _infer_outline(
     return document_title, _deduplicate_outline(validated)
 
 
+# ---------------------------------------------------------------------
+# Tree construction helpers
+# ---------------------------------------------------------------------
+
 def _make_page_node(
     page_number: int,
     blocks: list[dict],
     document_id: str,
 ) -> dict:
-    """Create a page node containing only its assigned text blocks."""
+    """Create a page node containing its assigned text blocks."""
     content = "\n".join(
         block["text"]
         for block in blocks
-        if block["text"]
+        if block.get("text")
     ).strip()
 
     return {
@@ -492,86 +685,44 @@ def _make_page_node(
     }
 
 
-def _build_hierarchy(
+def _make_section_node(
     document_id: str,
-    filename: str,
-    document_title: str,
-    pages: list[dict],
-    records: list[dict],
-    outline: list[dict],
+    index: int,
+    title: str,
+    level: int,
+    start_page: int,
+    start_block: int,
 ) -> dict:
-    """
-    Build the document tree without generating section summaries.
+    return {
+        "node_id": f"{document_id}_section_{index}",
+        "node_type": "section",
+        "title": title,
+        "level": level,
+        "start_page": start_page,
+        "start_block": start_block,
+        "end_page": start_page,
+        "summary": "",
+        "content": "",
+        "children": [],
+    }
 
-    Text blocks are assigned to the deepest matching section. Page nodes
-    contain only the text assigned to that section, preventing full-page
-    duplication across unrelated sections.
-    """
-    page_numbers = [
-        page["page_number"]
-        for page in pages
-    ]
 
-    if not page_numbers:
-        return {
-            "node_id": document_id,
-            "node_type": "document",
-            "title": document_title or filename,
-            "filename": filename,
-            "start_page": 0,
-            "end_page": 0,
-            "summary": "",
-            "children": [],
-        }
-
-    # If no reliable headings exist, preserve the document in one section.
-    if not outline:
-        outline = [{
-            "title": "Document content",
-            "level": 1,
-            "start_page": page_numbers[0],
-            "start_block": -1,
-        }]
-
+def _attach_sections(outline: list[dict], document_id: str) -> list[dict]:
+    """Convert a flat outline into a nested section hierarchy."""
     sections = []
 
-    for index, heading in enumerate(outline):
-        sections.append({
-            "node_id": f"{document_id}_section_{index + 1}",
-            "node_type": "section",
-            "title": heading["title"],
-            "level": heading["level"],
-            "start_page": heading["start_page"],
-            "start_block": heading["start_block"],
-            "end_page": page_numbers[-1],
-            "summary": "",
-            "content": "",
-            "children": [],
-        })
+    for index, heading in enumerate(outline, start=1):
+        sections.append(
+            _make_section_node(
+                document_id=document_id,
+                index=index,
+                title=heading["title"],
+                level=heading["level"],
+                start_page=heading["start_page"],
+                start_block=heading["start_block"],
+            )
+        )
 
-    # Find the end position for each section. A heading at the same
-    # or a higher level closes the current section.
-    section_end_positions = {}
-
-    for index, section in enumerate(sections):
-        end_position = None
-
-        for next_section in sections[index + 1:]:
-            if next_section["level"] <= section["level"]:
-                end_position = (
-                    next_section["start_page"],
-                    next_section["start_block"],
-                )
-                break
-
-        section_end_positions[section["node_id"]] = end_position
-
-        if end_position is not None:
-            section["end_page"] = end_position[0]
-        else:
-            section["end_page"] = page_numbers[-1]
-
-    # Create nested section hierarchy.
     roots = []
     stack = []
 
@@ -586,18 +737,62 @@ def _build_hierarchy(
 
         stack.append(section)
 
-    # Assign each text block to the deepest applicable section.
+    return sections, roots
+
+
+def _calculate_section_end_positions(
+    sections: list[dict],
+    last_page: int,
+) -> dict:
+    """
+    Calculate exclusive end positions.
+
+    A section ends at the next heading of the same or higher level.
+    A subsection does not end its parent section.
+    """
+    end_positions = {}
+
+    for index, section in enumerate(sections):
+        end_position = None
+
+        for next_section in sections[index + 1:]:
+            if next_section["level"] <= section["level"]:
+                end_position = (
+                    next_section["start_page"],
+                    next_section["start_block"],
+                )
+                break
+
+        end_positions[section["node_id"]] = end_position
+
+        if end_position:
+            section["end_page"] = end_position[0]
+        else:
+            section["end_page"] = last_page
+
+    return end_positions
+
+
+def _assign_records_to_sections(
+    records: list[dict],
+    sections: list[dict],
+    end_positions: dict,
+) -> tuple[dict, list[dict]]:
+    """
+    Assign each record to the deepest matching section.
+
+    Content before the first heading is kept separately instead of
+    being incorrectly assigned to the first section.
+    """
     assigned = {
         section["node_id"]: []
         for section in sections
     }
 
-    for record in records:
-        position = (
-            record["page_number"],
-            record["block_index"],
-        )
+    unclassified = []
 
+    for record in records:
+        position = _position_key(record)
         candidates = []
 
         for section in sections:
@@ -605,40 +800,45 @@ def _build_hierarchy(
                 section["start_page"],
                 section["start_block"],
             )
-            end_position = section_end_positions[
-                section["node_id"]
-            ]
+
+            end_position = end_positions.get(section["node_id"])
 
             if position < start_position:
                 continue
 
-            if (
-                end_position is not None
-                and position >= end_position
-            ):
+            if end_position is not None and position >= end_position:
                 continue
 
             candidates.append(section)
 
-        if candidates:
-            owner = max(
-                candidates,
-                key=lambda item: (
-                    item["level"],
-                    item["start_page"],
-                    item["start_block"],
-                ),
-            )
-            assigned[owner["node_id"]].append(record)
+        if not candidates:
+            unclassified.append(record)
+            continue
 
-        else:
-            # Preserve introductory text before the first detected heading.
-            first_section = sections[0]
-            assigned[first_section["node_id"]].append(record)
+        # Prefer the deepest section, then the most recently started one.
+        owner = max(
+            candidates,
+            key=lambda item: (
+                item["level"],
+                item["start_page"],
+                item["start_block"],
+            ),
+        )
 
-    # Add page nodes with their assigned text.
+        assigned[owner["node_id"]].append(record)
+
+    return assigned, unclassified
+
+
+def _populate_section_content(
+    sections: list[dict],
+    assigned: dict,
+) -> None:
+    """Populate section text and page children."""
     for section in sections:
-        section_records = assigned[section["node_id"]]
+        section_records = assigned.get(section["node_id"], [])
+
+        section_records.sort(key=_position_key)
 
         section["content"] = "\n".join(
             record["text"]
@@ -652,16 +852,144 @@ def _build_hierarchy(
                 record["page_number"], []
             ).append(record)
 
-        for page_number, page_records in sorted(by_page.items()):
-            section["children"].append(
-                _make_page_node(
-                    page_number,
-                    page_records,
-                    section["node_id"],
-                )
+        section["children"].extend(
+            _make_page_node(
+                page_number=page_number,
+                blocks=page_records,
+                document_id=section["node_id"],
             )
+            for page_number, page_records in sorted(by_page.items())
+        )
 
-    # No Gemini summary calls are made during tree construction.
+
+def _make_unclassified_node(
+    document_id: str,
+    records: list[dict],
+) -> dict | None:
+    """
+    Preserve text that cannot safely be assigned to a detected section.
+
+    This commonly includes front matter, title blocks, abstracts,
+    metadata, and content preceding the first recognized heading.
+    """
+    if not records:
+        return None
+
+    records = sorted(records, key=_position_key)
+
+    by_page = {}
+
+    for record in records:
+        by_page.setdefault(
+            record["page_number"], []
+        ).append(record)
+
+    children = [
+        _make_page_node(
+            page_number=page_number,
+            blocks=page_records,
+            document_id=f"{document_id}_unclassified",
+        )
+        for page_number, page_records in sorted(by_page.items())
+    ]
+
+    return {
+        "node_id": f"{document_id}_unclassified",
+        "node_type": "section",
+        "title": "Unclassified content",
+        "level": 1,
+        "start_page": min(record["page_number"] for record in records),
+        "start_block": min(
+            record["block_index"]
+            for record in records
+            if record["page_number"]
+            == min(item["page_number"] for item in records)
+        ),
+        "end_page": max(record["page_number"] for record in records),
+        "summary": "",
+        "content": "\n".join(
+            record["text"] for record in records
+        ).strip(),
+        "children": children,
+    }
+
+
+# ---------------------------------------------------------------------
+# Main hierarchy builder
+# ---------------------------------------------------------------------
+
+def _build_hierarchy(
+    document_id: str,
+    filename: str,
+    document_title: str,
+    pages: list[dict],
+    records: list[dict],
+    outline: list[dict],
+) -> dict:
+    """
+    Build a document tree with nested sections and page nodes.
+
+    Every extracted text block is assigned either to a detected
+    section or to an Unclassified content node. No block is silently
+    discarded or forced into the first detected section.
+    """
+    page_numbers = sorted({
+        page["page_number"]
+        for page in pages
+    })
+
+    if not page_numbers:
+        return {
+            "node_id": document_id,
+            "node_type": "document",
+            "title": document_title or filename,
+            "filename": filename,
+            "start_page": 0,
+            "end_page": 0,
+            "summary": "",
+            "children": [],
+        }
+
+    records = sorted(records, key=_position_key)
+    outline = _deduplicate_outline(outline)
+
+    # If no reliable headings are available, preserve the document
+    # under one synthetic root section.
+    if not outline:
+        outline = [{
+            "title": "Document content",
+            "level": 1,
+            "start_page": page_numbers[0],
+            "start_block": 0,
+        }]
+
+    sections, roots = _attach_sections(
+        outline,
+        document_id,
+    )
+
+    end_positions = _calculate_section_end_positions(
+        sections,
+        page_numbers[-1],
+    )
+
+    assigned, unclassified = _assign_records_to_sections(
+        records,
+        sections,
+        end_positions,
+    )
+
+    _populate_section_content(sections, assigned)
+
+    # Keep front matter and other unmatched records visible.
+    unclassified_node = _make_unclassified_node(
+        document_id,
+        unclassified,
+    )
+
+    if unclassified_node:
+        roots.insert(0, unclassified_node)
+
     return {
         "node_id": document_id,
         "node_type": "document",
@@ -674,16 +1002,29 @@ def _build_hierarchy(
     }
 
 
+# ---------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------
+
 def build_page_index_tree(
     document_id: str,
     filename: str,
     pages: list[dict],
 ) -> dict:
     """
-    Build a document-adaptive hierarchical index.
+    Build an adaptive hierarchical index for an extracted PDF.
 
-    Gemini infers headings and levels. If outline inference fails, a
-    conservative local detector is used. No section summaries are generated.
+    Processing flow:
+        1. Prepare text and layout metadata.
+        2. Ask Gemini to infer document structure.
+        3. Validate every heading against an actual block.
+        4. Use local heading detection if AI inference fails
+           or produces no usable headings.
+        5. Build nested section and page nodes.
+        6. Preserve unmatched content separately.
+
+    The function keeps the existing public interface so the indexing
+    service does not need to change its call signature.
     """
     prepared_pages, records = _prepare_document(pages)
 
@@ -705,8 +1046,13 @@ def build_page_index_tree(
 
     try:
         document_title, outline = _infer_outline(records)
+
     except Exception as exc:
         print(f"Document outline inference failed: {exc}")
+
+    # Important: fallback also runs when Gemini responds successfully
+    # but returns an empty or unusable headings list.
+    if not outline:
         outline = _fallback_outline(records)
 
     return _build_hierarchy(
