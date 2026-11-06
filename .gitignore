@@ -11,3 +11,10 @@ __pycache__/
 node_modules/
 dist/
 .vscode/
+.coverage
+htmlcov/
+
+*.egg-info/
+build/
+.DS_Store
+Thumbs.db

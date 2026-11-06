@@ -18,11 +18,15 @@ app.add_middleware(
 )
 
 app.include_router(documents_router)
+
 @app.get("/")
 def home():
     return {
         "message": "Page Indexing File System API is running"
     }
 
-
-
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy"
+    }

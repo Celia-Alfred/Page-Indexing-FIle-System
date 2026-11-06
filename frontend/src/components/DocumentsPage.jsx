@@ -1,3 +1,4 @@
+
 import { useMemo, useRef, useState } from "react";
 import {
   Upload,
@@ -8,7 +9,8 @@ import {
   ArrowUpDown,
 } from "lucide-react";
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+import { uploadDocument } from "../services/api";
+
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 function DocumentsPage({
@@ -27,7 +29,9 @@ function DocumentsPage({
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("newest");
 
-  const safeDocuments = Array.isArray(documents) ? documents : [];
+  const safeDocuments = Array.isArray(documents)
+    ? documents
+    : [];
 
   const filteredDocuments = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -66,11 +70,17 @@ function DocumentsPage({
       }
 
       const dateA = new Date(
-        a.uploadedAt || a.uploaded_at || a.created_at || 0
+        a.uploadedAt ||
+          a.uploaded_at ||
+          a.created_at ||
+          0
       ).getTime();
 
       const dateB = new Date(
-        b.uploadedAt || b.uploaded_at || b.created_at || 0
+        b.uploadedAt ||
+          b.uploaded_at ||
+          b.created_at ||
+          0
       ).getTime();
 
       return sortBy === "oldest"
@@ -82,7 +92,10 @@ function DocumentsPage({
   const uploadPdf = async (file) => {
     if (!file) return;
 
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
+    if (
+      file.type !== "application/pdf" &&
+      !file.name.toLowerCase().endsWith(".pdf")
+    ) {
       setUploadError("Please select a PDF file.");
       setUploadMessage("");
       return;
@@ -101,34 +114,28 @@ function DocumentsPage({
     setUploadMessage("");
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const result = await uploadDocument(file);
 
-      const response = await fetch(`${API_BASE_URL}/documents/upload`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const result = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
+      if (!result.document_id) {
         throw new Error(
-          result.detail || `Upload failed (${response.status}).`
+          "The backend did not return a document ID."
         );
       }
 
       const uploadedDocument = {
         ...result,
-        id: result.id || result.document_id || result._id,
-        filename:
-          result.filename || result.file_name || result.name || file.name,
-        name: result.name || result.filename || file.name,
+        id: result.document_id,
+        document_id: result.document_id,
+        filename: result.filename || file.name,
+        name: result.filename || file.name,
         size: file.size,
         uploadedAt: new Date().toISOString(),
       };
 
       setDocuments((previousDocuments) => {
-        const existingDocuments = Array.isArray(previousDocuments)
+        const existingDocuments = Array.isArray(
+          previousDocuments
+        )
           ? previousDocuments
           : [];
 
@@ -136,14 +143,18 @@ function DocumentsPage({
           uploadedDocument,
           ...existingDocuments.filter(
             (document) =>
-              document.id !== uploadedDocument.id ||
-              !uploadedDocument.id
+              String(
+                document.document_id ||
+                  document.id ||
+                  document._id
+              ) !== String(uploadedDocument.document_id)
           ),
         ];
       });
 
       setUploadMessage(
-        result.message || `${file.name} uploaded successfully.`
+        result.message ||
+          `${file.name} uploaded successfully.`
       );
 
       setSearchQuery("");
@@ -165,6 +176,7 @@ function DocumentsPage({
 
     setUploadError("");
     setUploadMessage("");
+
     uploadPdf(file);
   };
 
@@ -174,12 +186,16 @@ function DocumentsPage({
 
     if (uploading) return;
 
-    const files = Array.from(event.dataTransfer.files || []);
+    const files = Array.from(
+      event.dataTransfer.files || []
+    );
 
     if (files.length === 0) return;
 
     if (files.length > 1) {
-      setUploadError("Please upload one PDF at a time.");
+      setUploadError(
+        "Please upload one PDF at a time."
+      );
       setUploadMessage("");
       return;
     }
@@ -188,7 +204,19 @@ function DocumentsPage({
   };
 
   const openDocument = (document) => {
-    setSelectedDocument(document);
+    const documentId =
+      document.document_id ||
+      document.id ||
+      document._id;
+
+    if (!documentId) {
+      setUploadError(
+        "Could not identify this document."
+      );
+      return;
+    }
+
+    setSelectedDocument(String(documentId));
     setActivePage("chat");
   };
 
@@ -197,12 +225,16 @@ function DocumentsPage({
       <div className="page-heading">
         <div>
           <h2>Your Documents</h2>
-          <p>Upload PDFs to build their intelligent page index.</p>
+          <p>
+            Upload PDFs to build their intelligent page index.
+          </p>
         </div>
 
         <span className="document-count">
           {safeDocuments.length}{" "}
-          {safeDocuments.length === 1 ? "document" : "documents"}
+          {safeDocuments.length === 1
+            ? "document"
+            : "documents"}
         </span>
       </div>
 
@@ -223,7 +255,9 @@ function DocumentsPage({
 
           if (
             !event.relatedTarget ||
-            !event.currentTarget.contains(event.relatedTarget)
+            !event.currentTarget.contains(
+              event.relatedTarget
+            )
           ) {
             setDragging(false);
           }
@@ -232,7 +266,10 @@ function DocumentsPage({
       >
         <div className="upload-icon">
           {uploading ? (
-            <LoaderCircle className="spin" size={27} />
+            <LoaderCircle
+              className="spin"
+              size={27}
+            />
           ) : (
             <Upload size={27} />
           )}
@@ -256,7 +293,9 @@ function DocumentsPage({
           className="primary-button"
           type="button"
           disabled={uploading}
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() =>
+            fileInputRef.current?.click()
+          }
         >
           <Upload size={16} />
           Choose PDF
@@ -269,7 +308,9 @@ function DocumentsPage({
           hidden
           disabled={uploading}
           onChange={(event) => {
-            handleSelectedFile(event.target.files?.[0]);
+            handleSelectedFile(
+              event.target.files?.[0]
+            );
             event.target.value = "";
           }}
         />
@@ -281,7 +322,10 @@ function DocumentsPage({
 
       {uploading && (
         <div className="upload-status" role="status">
-          <LoaderCircle className="spin" size={18} />
+          <LoaderCircle
+            className="spin"
+            size={18}
+          />
           Uploading and indexing PDF...
         </div>
       )}
@@ -304,8 +348,11 @@ function DocumentsPage({
             <h3>Indexed Documents</h3>
 
             <p className="results-count">
-              Showing {filteredDocuments.length} of {safeDocuments.length}{" "}
-              {safeDocuments.length === 1 ? "document" : "documents"}
+              Showing {filteredDocuments.length} of{" "}
+              {safeDocuments.length}{" "}
+              {safeDocuments.length === 1
+                ? "document"
+                : "documents"}
             </p>
           </div>
         </div>
@@ -317,7 +364,9 @@ function DocumentsPage({
             <input
               type="text"
               value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
+              onChange={(event) =>
+                setSearchQuery(event.target.value)
+              }
               placeholder="Search documents by filename..."
               aria-label="Search documents by filename"
             />
@@ -340,13 +389,23 @@ function DocumentsPage({
 
             <select
               value={sortBy}
-              onChange={(event) => setSortBy(event.target.value)}
+              onChange={(event) =>
+                setSortBy(event.target.value)
+              }
               aria-label="Sort documents"
             >
-              <option value="newest">Newest first</option>
-              <option value="oldest">Oldest first</option>
-              <option value="name-asc">Name: A to Z</option>
-              <option value="name-desc">Name: Z to A</option>
+              <option value="newest">
+                Newest first
+              </option>
+              <option value="oldest">
+                Oldest first
+              </option>
+              <option value="name-asc">
+                Name: A to Z
+              </option>
+              <option value="name-desc">
+                Name: Z to A
+              </option>
             </select>
           </label>
         </div>
@@ -355,7 +414,9 @@ function DocumentsPage({
           <div className="empty-state">
             <FileText size={34} />
             <h4>No documents yet</h4>
-            <p>Upload a PDF to see it listed here.</p>
+            <p>
+              Upload a PDF to see it listed here.
+            </p>
           </div>
         ) : filteredDocuments.length === 0 ? (
           <div className="empty-state no-search-results">
@@ -363,7 +424,8 @@ function DocumentsPage({
             <h4>No matching documents</h4>
 
             <p>
-              No filenames match "{searchQuery}". Try another search term.
+              No filenames match "{searchQuery}". Try
+              another search term.
             </p>
 
             <button
@@ -376,45 +438,58 @@ function DocumentsPage({
           </div>
         ) : (
           <div className="document-grid">
-            {filteredDocuments.map((document, index) => {
-              const documentName =
-                document.filename ||
-                document.file_name ||
-                document.name ||
-                "Untitled document";
+            {filteredDocuments.map(
+              (document, index) => {
+                const documentName =
+                  document.filename ||
+                  document.file_name ||
+                  document.name ||
+                  "Untitled document";
 
-              const documentKey =
-                document.id ||
-                document.document_id ||
-                document._id ||
-                `${documentName}-${index}`;
+                const documentKey =
+                  document.document_id ||
+                  document.id ||
+                  document._id ||
+                  `${documentName}-${index}`;
 
-              return (
-                <article className="document-card" key={documentKey}>
-                  <div className="document-icon">
-                    <FileText size={24} />
-                  </div>
-
-                  <div className="document-details">
-                    <h4 title={documentName}>{documentName}</h4>
-
-                    <p>
-                      {typeof document.size === "number"
-                        ? `${(document.size / (1024 * 1024)).toFixed(2)} MB`
-                        : "PDF document"}
-                    </p>
-                  </div>
-
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => openDocument(document)}
+                return (
+                  <article
+                    className="document-card"
+                    key={documentKey}
                   >
-                    Ask AI
-                  </button>
-                </article>
-              );
-            })}
+                    <div className="document-icon">
+                      <FileText size={24} />
+                    </div>
+
+                    <div className="document-details">
+                      <h4 title={documentName}>
+                        {documentName}
+                      </h4>
+
+                      <p>
+                        {typeof document.size ===
+                        "number"
+                          ? `${(
+                              document.size /
+                              (1024 * 1024)
+                            ).toFixed(2)} MB`
+                          : `${document.total_pages || 0} pages`}
+                      </p>
+                    </div>
+
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() =>
+                        openDocument(document)
+                      }
+                    >
+                      Ask AI
+                    </button>
+                  </article>
+                );
+              }
+            )}
           </div>
         )}
       </div>
