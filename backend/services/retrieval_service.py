@@ -1,7 +1,12 @@
 
 import json
 import logging
+import os
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 
 from database import (
     page_index_trees_collection,
@@ -12,7 +17,94 @@ from services.llm_service import (
     generate_content_with_retry,
 )
 
+
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+LANGFUSE_ENABLED = (
+    os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
+)
+
+LANGFUSE_LOG_CONTENT = (
+    os.getenv("LANGFUSE_LOG_CONTENT", "false").lower() == "true"
+)
+
 logger = logging.getLogger(__name__)
+
+
+
+langfuse = None
+
+if LANGFUSE_ENABLED:
+    try:
+        if (
+            os.getenv("LANGFUSE_PUBLIC_KEY")
+            and os.getenv("LANGFUSE_SECRET_KEY")
+        ):
+            from langfuse import get_client
+
+            langfuse = get_client()
+
+            logger.info(
+                "Langfuse retrieval tracing initialized successfully"
+            )
+        else:
+            logger.warning(
+                "Langfuse is enabled but API keys are missing"
+            )
+
+    except Exception:
+        logger.exception(
+            "Failed to initialize Langfuse. "
+            "Retrieval will continue without tracing."
+        )
+
+
+def _start_span(
+    name: str,
+    metadata: dict | None = None,
+):
+    """
+    Start a Langfuse span.
+
+    If Langfuse is disabled or unavailable, return a
+    no-op context manager so retrieval continues normally.
+    """
+    if langfuse is None:
+        return nullcontext(None)
+
+    try:
+        return langfuse.start_as_current_observation(
+            as_type="span",
+            name=name,
+            metadata=metadata or {},
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not start Langfuse span: %s",
+            name,
+        )
+        return nullcontext(None)
+
+
+def _update_span(
+    observation,
+    **kwargs,
+):
+    """Safely update a Langfuse observation."""
+    if observation is None:
+        return
+
+    try:
+        observation.update(**kwargs)
+
+    except Exception:
+        logger.exception(
+            "Could not update Langfuse observation"
+        )
+
+
 
 MAX_SEARCH_ROUNDS = 5
 MAX_SECTIONS_PER_ROUND = 3
@@ -21,8 +113,10 @@ MAX_PAGES_IN_CONTEXT = 12
 MAX_PAGE_CHARS = 9000
 
 
+
 def _parse_json_response(response: Any) -> dict:
     """Parse and validate a Gemini JSON response."""
+
     response_text = (
         getattr(response, "text", None) or ""
     ).strip()
@@ -34,6 +128,7 @@ def _parse_json_response(response: Any) -> dict:
 
     try:
         result = json.loads(response_text)
+
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "Gemini returned invalid JSON during tree retrieval"
@@ -47,8 +142,59 @@ def _parse_json_response(response: Any) -> dict:
     return result
 
 
-def _valid_page_range(node: dict) -> tuple[int, int] | None:
+
+
+def _understand_query_with_trace(
+    question: str,
+) -> dict:
+    """
+    Understand the user's question and record the
+    query analysis operation in Langfuse.
+    """
+
+    with _start_span(
+        "pageindex-query-understanding",
+        metadata={
+            "operation": "query_understanding",
+            "provider": "Google Gemini",
+        },
+    ) as observation:
+
+        _update_span(
+            observation,
+            input={
+                "question": question,
+            },
+        )
+
+        query_analysis = understand_query(question)
+
+        if not isinstance(query_analysis, dict):
+            raise RuntimeError(
+                "Query analysis returned an invalid structure"
+            )
+
+        _update_span(
+            observation,
+            output={
+                "query_analysis": query_analysis,
+                "topic": query_analysis.get("topic"),
+                "keywords": query_analysis.get("keywords", []),
+                "information_needed": query_analysis.get(
+                    "information_needed"
+                ),
+            },
+        )
+
+        return query_analysis
+
+
+
+def _valid_page_range(
+    node: dict,
+) -> tuple[int, int] | None:
     """Return a valid inclusive page range."""
+
     start = node.get("start_page")
     end = node.get("end_page")
 
@@ -65,11 +211,18 @@ def _valid_page_range(node: dict) -> tuple[int, int] | None:
     return start, end
 
 
-def _collect_sections(tree: dict) -> list[dict]:
+
+def _collect_sections(
+    tree: dict,
+) -> list[dict]:
     """Flatten the tree while preserving its hierarchy."""
+
     sections = []
 
-    def visit(nodes, ancestors=None):
+    def visit(
+        nodes,
+        ancestors=None,
+    ):
         if ancestors is None:
             ancestors = []
 
@@ -77,17 +230,23 @@ def _collect_sections(tree: dict) -> list[dict]:
             return
 
         for node in nodes:
+
             if not isinstance(node, dict):
                 continue
 
             next_ancestors = ancestors
 
             if node.get("node_type") == "section":
-                title = str(node.get("title") or "").strip()
+
+                title = str(
+                    node.get("title") or ""
+                ).strip()
+
                 page_range = _valid_page_range(node)
                 node_id = node.get("node_id")
 
                 if node_id and page_range:
+
                     sections.append({
                         "node_id": str(node_id),
                         "title": title,
@@ -113,6 +272,7 @@ def _collect_sections(tree: dict) -> list[dict]:
     unique_sections = {}
 
     for section in sections:
+
         unique_sections.setdefault(
             section["node_id"],
             section,
@@ -121,8 +281,13 @@ def _collect_sections(tree: dict) -> list[dict]:
     return list(unique_sections.values())
 
 
-def _make_tree_outline(sections: list[dict]) -> list[dict]:
+
+
+def _make_tree_outline(
+    sections: list[dict],
+) -> list[dict]:
     """Create compact metadata for reasoning over the document tree."""
+
     return [
         {
             "node_id": section["node_id"],
@@ -138,6 +303,7 @@ def _make_tree_outline(sections: list[dict]) -> list[dict]:
     ]
 
 
+
 def _select_sections(
     question: str,
     query_analysis: dict,
@@ -146,6 +312,7 @@ def _select_sections(
     previous_evidence: list[dict],
 ) -> list[str]:
     """Ask Gemini to select useful sections from the document tree."""
+
     remaining = [
         node
         for node in outline
@@ -205,31 +372,69 @@ Rules:
 - Return JSON only, without Markdown fences.
 """
 
-    response = generate_content_with_retry(
-        prompt,
-        config={"response_mime_type": "application/json"},
-    )
+    with _start_span(
+        "pageindex-section-selection",
+        metadata={
+            "available_sections": len(remaining),
+            "previous_evidence_pages": len(previous_evidence),
+            "selection_limit": MAX_SECTIONS_PER_ROUND,
+        },
+    ) as observation:
 
-    result = _parse_json_response(response)
-    selected = result.get("selected_node_ids", [])
+        if LANGFUSE_LOG_CONTENT:
 
-    if not isinstance(selected, list):
-        return []
+            _update_span(
+                observation,
+                input={
+                    "question": question,
+                    "query_analysis": query_analysis,
+                    "available_sections": remaining,
+                    "previous_evidence": evidence_summary,
+                },
+            )
 
-    valid_ids = {
-        node["node_id"]
-        for node in remaining
-    }
+        response = generate_content_with_retry(
+            prompt,
+            config={
+                "response_mime_type": "application/json"
+            },
+        )
 
-    return list(dict.fromkeys(
-        node_id
-        for node_id in selected
-        if isinstance(node_id, str)
-        and node_id in valid_ids
-    ))[:MAX_SECTIONS_PER_ROUND]
+        result = _parse_json_response(response)
+
+        selected = result.get(
+            "selected_node_ids",
+            [],
+        )
+
+        if not isinstance(selected, list):
+            selected = []
+
+        valid_ids = {
+            node["node_id"]
+            for node in remaining
+        }
+
+        valid_selected = list(dict.fromkeys(
+            node_id
+            for node_id in selected
+            if isinstance(node_id, str)
+            and node_id in valid_ids
+        ))[:MAX_SECTIONS_PER_ROUND]
+
+        _update_span(
+            observation,
+            output={
+                "selected_node_ids": valid_selected,
+                "reasoning": result.get("reasoning", ""),
+            },
+        )
+
+        return valid_selected
 
 
-def _read_section_pages(
+
+def _read_section_pages_impl(
     document_id: Any,
     filename: str,
     selected_sections: list[dict],
@@ -238,6 +443,7 @@ def _read_section_pages(
     Read original page text and preserve all OCR/native
     extraction and coordinate metadata.
     """
+
     if not selected_sections:
         return []
 
@@ -263,6 +469,7 @@ def _read_section_pages(
     section_by_page = {}
 
     for page in pages_cursor:
+
         page_number = page.get("page_number")
 
         if (
@@ -303,8 +510,12 @@ def _read_section_pages(
     results = []
 
     for page_number in sorted(section_by_page):
+
         section, page = section_by_page[page_number]
-        text = (page.get("text") or "").strip()
+
+        text = (
+            page.get("text") or ""
+        ).strip()
 
         if not text:
             continue
@@ -345,14 +556,77 @@ def _read_section_pages(
     return results
 
 
-def _assess_evidence(
+def _read_section_pages(
+    document_id: Any,
+    filename: str,
+    selected_sections: list[dict],
+) -> list[dict]:
+    """Retrieve pages and record the operation in Langfuse."""
+
+    if not selected_sections:
+        return []
+
+    with _start_span(
+        "pageindex-page-retrieval",
+        metadata={
+            "document_id": str(document_id),
+            "filename": filename,
+            "selected_sections": [
+                section["node_id"]
+                for section in selected_sections
+            ],
+        },
+    ) as observation:
+
+        pages = _read_section_pages_impl(
+            document_id=document_id,
+            filename=filename,
+            selected_sections=selected_sections,
+        )
+
+        page_details = [
+            {
+                "page_number": page["page_number"],
+                "section_id": page["section_id"],
+                "section_title": page["section_title"],
+                "extraction_source": page["extraction_source"],
+            }
+            for page in pages
+        ]
+
+        output = {
+            "pages_retrieved": len(pages),
+            "pages": page_details,
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+
+            output["retrieved_evidence"] = [
+                {
+                    "page_number": page["page_number"],
+                    "text": page["text"],
+                }
+                for page in pages
+            ]
+
+        _update_span(
+            observation,
+            output=output,
+        )
+
+        return pages
+
+
+def _assess_evidence_impl(
     question: str,
     evidence: list[dict],
     visited_ids: set[str],
     outline: list[dict],
 ) -> dict:
     """Ask Gemini whether the inspected evidence answers the question."""
+
     if not evidence:
+
         return {
             "sufficient": False,
             "next_node_ids": [],
@@ -414,7 +688,9 @@ Rules:
 
     response = generate_content_with_retry(
         prompt,
-        config={"response_mime_type": "application/json"},
+        config={
+            "response_mime_type": "application/json"
+        },
     )
 
     result = _parse_json_response(response)
@@ -424,7 +700,10 @@ Rules:
         for node in remaining
     }
 
-    next_ids = result.get("next_node_ids", [])
+    next_ids = result.get(
+        "next_node_ids",
+        [],
+    )
 
     if not isinstance(next_ids, list):
         next_ids = []
@@ -445,17 +724,76 @@ Rules:
     }
 
 
-def _group_pages(pages: list[dict]) -> list[dict]:
+def _assess_evidence(
+    question: str,
+    evidence: list[dict],
+    visited_ids: set[str],
+    outline: list[dict],
+) -> dict:
+    """Assess retrieved evidence and record the decision in Langfuse."""
+
+    with _start_span(
+        "pageindex-evidence-assessment",
+        metadata={
+            "evidence_pages": len(evidence),
+            "visited_sections": len(visited_ids),
+            "remaining_sections": sum(
+                1
+                for node in outline
+                if node["node_id"] not in visited_ids
+            ),
+        },
+    ) as observation:
+
+        if LANGFUSE_LOG_CONTENT:
+
+            _update_span(
+                observation,
+                input={
+                    "question": question,
+                    "evidence": [
+                        {
+                            "page_number": item["page_number"],
+                            "section_title": item["section_title"],
+                            "text": item["text"],
+                        }
+                        for item in evidence
+                    ],
+                },
+            )
+
+        result = _assess_evidence_impl(
+            question=question,
+            evidence=evidence,
+            visited_ids=visited_ids,
+            outline=outline,
+        )
+
+        _update_span(
+            observation,
+            output=result,
+        )
+
+        return result
+
+
+
+def _group_pages(
+    pages: list[dict],
+) -> list[dict]:
     """Group retrieved pages by their associated section."""
+
     groups = {}
 
     for page in pages:
+
         key = (
             str(page["document_id"]),
             str(page["section_id"]),
         )
 
         if key not in groups:
+
             groups[key] = {
                 "document_id": page["document_id"],
                 "filename": page["filename"],
@@ -497,7 +835,8 @@ def _group_pages(pages: list[dict]) -> list[dict]:
     return list(groups.values())
 
 
-def retrieve_relevant_pages(
+
+def _retrieve_relevant_pages_impl(
     question: str,
     document_id: str | None = None,
     top_k: int = 5,
@@ -507,8 +846,10 @@ def retrieve_relevant_pages(
 
     top_k is retained for API compatibility and controls the requested
     page budget. The actual returned page count is capped for safety.
+
     Retrieval is based on tree navigation, not vector similarity.
     """
+
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Question cannot be empty")
 
@@ -521,12 +862,10 @@ def retrieve_relevant_pages(
             "top_k must be an integer of at least 1"
         )
 
-    query_analysis = understand_query(question)
 
-    if not isinstance(query_analysis, dict):
-        raise RuntimeError(
-            "Query analysis returned an invalid structure"
-        )
+    query_analysis = _understand_query_with_trace(
+        question
+    )
 
     tree_filter = (
         {"document_id": document_id}
@@ -539,6 +878,7 @@ def retrieve_relevant_pages(
     )
 
     if not trees:
+
         return {
             "question": question,
             "query_analysis": query_analysis,
@@ -552,19 +892,26 @@ def retrieve_relevant_pages(
     retrieval_trace = []
     selected_section_ids = set()
 
+
     for tree in trees:
+
         current_document_id = tree.get("document_id")
 
         if current_document_id is None:
             continue
 
-        filename = tree.get("filename") or "Unknown document"
+        filename = (
+            tree.get("filename")
+            or "Unknown document"
+        )
+
         sections = _collect_sections(tree)
 
         if not sections:
             continue
 
         outline = _make_tree_outline(sections)
+
         sections_by_id = {
             section["node_id"]: section
             for section in sections
@@ -575,13 +922,18 @@ def retrieve_relevant_pages(
         evidence_for_document = []
         round_number = 0
 
+
         while round_number < MAX_SEARCH_ROUNDS:
+
             round_number += 1
 
             if queued_ids:
+
                 chosen_ids = queued_ids
                 queued_ids = []
+
             else:
+
                 chosen_ids = _select_sections(
                     question=question,
                     query_analysis=query_analysis,
@@ -593,9 +945,11 @@ def retrieve_relevant_pages(
             chosen_ids = list(dict.fromkeys(
                 node_id
                 for node_id in chosen_ids
-                if isinstance(node_id, str)
-                and node_id in sections_by_id
-                and node_id not in visited_ids
+                if (
+                    isinstance(node_id, str)
+                    and node_id in sections_by_id
+                    and node_id not in visited_ids
+                )
             ))[:MAX_SECTIONS_PER_ROUND]
 
             if not chosen_ids:
@@ -607,10 +961,15 @@ def retrieve_relevant_pages(
             ]
 
             visited_ids.update(chosen_ids)
+
             selected_section_ids.update(
-                (str(current_document_id), node_id)
+                (
+                    str(current_document_id),
+                    node_id,
+                )
                 for node_id in chosen_ids
             )
+
 
             new_pages = _read_section_pages(
                 document_id=current_document_id,
@@ -619,6 +978,7 @@ def retrieve_relevant_pages(
             )
 
             for page in new_pages:
+
                 key = (
                     str(page["document_id"]),
                     page["page_number"],
@@ -635,18 +995,22 @@ def retrieve_relevant_pages(
 
                 evidence_for_document.append(page)
 
+
             evidence_by_page = {}
 
             for page in evidence_for_document:
+
                 key = (
                     str(page["document_id"]),
                     page["page_number"],
                 )
+
                 evidence_by_page[key] = page
 
             evidence_for_document = list(
                 evidence_by_page.values()
             )
+
 
             assessment = _assess_evidence(
                 question=question,
@@ -655,8 +1019,8 @@ def retrieve_relevant_pages(
                 outline=outline,
             )
 
-            retrieval_trace.append({
-                "document_id": current_document_id,
+            round_details = {
+                "document_id": str(current_document_id),
                 "round": round_number,
                 "selected_node_ids": chosen_ids,
                 "pages_read": [
@@ -665,7 +1029,40 @@ def retrieve_relevant_pages(
                 ],
                 "sufficient": assessment["sufficient"],
                 "reasoning": assessment["reasoning"],
-            })
+                "next_node_ids": assessment["next_node_ids"],
+            }
+
+            retrieval_trace.append(round_details)
+
+
+            with _start_span(
+                f"pageindex-search-round-{round_number}",
+                metadata={
+                    "document_id": str(current_document_id),
+                    "round": round_number,
+                    "selected_node_ids": chosen_ids,
+                    "pages_read": [
+                        page["page_number"]
+                        for page in new_pages
+                    ],
+                    "evidence_sufficient": assessment["sufficient"],
+                },
+            ) as observation:
+
+                _update_span(
+                    observation,
+                    output={
+                        "selected_sections": chosen_ids,
+                        "pages_retrieved": [
+                            page["page_number"]
+                            for page in new_pages
+                        ],
+                        "evidence_sufficient": assessment["sufficient"],
+                        "next_sections": assessment["next_node_ids"],
+                        "reasoning": assessment["reasoning"],
+                    },
+                )
+
 
             if assessment["sufficient"]:
                 break
@@ -674,6 +1071,7 @@ def retrieve_relevant_pages(
 
             if not queued_ids:
                 break
+
 
     page_budget = min(
         max(top_k, 5),
@@ -688,17 +1086,109 @@ def retrieve_relevant_pages(
         ),
     )[:page_budget]
 
+    grouped_results = _group_pages(
+        selected_pages
+    )
+
+    sections_found = len({
+        (
+            str(page["document_id"]),
+            str(page["section_id"]),
+        )
+        for page in selected_pages
+    })
+
+
     return {
         "question": question,
         "query_analysis": query_analysis,
-        "sections_found": len({
-            (
-                str(page["document_id"]),
-                str(page["section_id"]),
-            )
-            for page in selected_pages
-        }),
+        "sections_found": sections_found,
         "pages_found": len(selected_pages),
-        "results": _group_pages(selected_pages),
+        "results": grouped_results,
         "retrieval_trace": retrieval_trace,
     }
+
+
+def retrieve_relevant_pages(
+    question: str,
+    document_id: str | None = None,
+    top_k: int = 5,
+) -> dict:
+    """
+    Public retrieval function.
+
+    Creates the main PageIndex retrieval trace.
+    Child operations are recorded as nested observations.
+    """
+
+    with _start_span(
+        "pageindex-retrieval",
+        metadata={
+            "document_id": (
+                str(document_id)
+                if document_id
+                else "all"
+            ),
+            "top_k": top_k,
+            "retrieval_method": (
+                "vectorless_hierarchical_tree_search"
+            ),
+            "max_search_rounds": MAX_SEARCH_ROUNDS,
+        },
+    ) as observation:
+
+        _update_span(
+            observation,
+            input={
+                "question": question,
+                "document_id": (
+                    str(document_id)
+                    if document_id
+                    else None
+                ),
+                "top_k": top_k,
+            },
+        )
+
+        result = _retrieve_relevant_pages_impl(
+            question=question,
+            document_id=document_id,
+            top_k=top_k,
+        )
+
+
+        retrieved_pages = []
+
+        for group in result["results"]:
+
+            for page in group["pages"]:
+
+                retrieved_pages.append({
+                    "filename": group["filename"],
+                    "section_id": group["section_id"],
+                    "section_title": group["section_title"],
+                    "page_number": page["page_number"],
+                    "extraction_source": page.get(
+                        "extraction_source",
+                        "native",
+                    ),
+                })
+
+        trace_output = {
+            "query_analysis": result["query_analysis"],
+            "sections_found": result["sections_found"],
+            "pages_found": result["pages_found"],
+            "retrieved_pages": retrieved_pages,
+            "retrieval_rounds": result["retrieval_trace"],
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+
+            trace_output["retrieved_results"] = result["results"]
+
+        _update_span(
+            observation,
+            output=trace_output,
+        )
+
+        return result

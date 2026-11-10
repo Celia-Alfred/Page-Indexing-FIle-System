@@ -2,17 +2,109 @@
 import json
 import logging
 import math
+import os
 import re
 import unicodedata
+from contextlib import nullcontext
+from pathlib import Path
+from dotenv import load_dotenv
 
 from services.llm_service import generate_content_with_retry
 from services.citation_service import find_ocr_citation_boxes
 
 
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+LANGFUSE_ENABLED = (
+    os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
+)
+
+LANGFUSE_LOG_CONTENT = (
+    os.getenv("LANGFUSE_LOG_CONTENT", "false").lower() == "true"
+)
+
 logger = logging.getLogger(__name__)
 
-SOURCE_ID_PATTERN = re.compile(r"\[(S\d+)\]")
-WORD_PATTERN = re.compile(r"\w+", re.UNICODE)
+
+
+langfuse = None
+
+if LANGFUSE_ENABLED:
+    try:
+        if (
+            os.getenv("LANGFUSE_PUBLIC_KEY")
+            and os.getenv("LANGFUSE_SECRET_KEY")
+        ):
+            from langfuse import get_client
+
+            langfuse = get_client()
+
+            logger.info(
+                "Langfuse answer-service tracing initialized"
+            )
+        else:
+            logger.warning(
+                "Langfuse enabled but API keys are missing"
+            )
+
+    except Exception:
+        logger.exception(
+            "Failed to initialize Langfuse. "
+            "Answer generation will continue without tracing."
+        )
+
+
+def _start_span(
+    name: str,
+    metadata: dict | None = None,
+):
+    """Start a Langfuse span without interrupting answer generation."""
+
+    if langfuse is None:
+        return nullcontext(None)
+
+    try:
+        return langfuse.start_as_current_observation(
+            as_type="span",
+            name=name,
+            metadata=metadata or {},
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not start Langfuse span: %s",
+            name,
+        )
+        return nullcontext(None)
+
+
+def _update_span(
+    observation,
+    **kwargs,
+):
+    """Safely update a Langfuse observation."""
+
+    if observation is None:
+        return
+
+    try:
+        observation.update(**kwargs)
+
+    except Exception:
+        logger.exception(
+            "Could not update Langfuse observation"
+        )
+
+
+SOURCE_ID_PATTERN = re.compile(
+    r"\[(S\d+)\]"
+)
+
+WORD_PATTERN = re.compile(
+    r"\w+",
+    re.UNICODE,
+)
 
 
 def _parse_json_response(response):
@@ -23,7 +115,9 @@ def _parse_json_response(response):
     ).strip()
 
     if not response_text:
-        raise RuntimeError("Gemini returned an empty answer")
+        raise RuntimeError(
+            "Gemini returned an empty answer"
+        )
 
     response_text = re.sub(
         r"^\s*```(?:json)?\s*",
@@ -56,6 +150,7 @@ def _parse_json_response(response):
     return result
 
 
+
 def _normalize_text(text):
     """Normalize Unicode, case, and whitespace."""
 
@@ -64,7 +159,9 @@ def _normalize_text(text):
         str(text or ""),
     )
 
-    return " ".join(text.casefold().split())
+    return " ".join(
+        text.casefold().split()
+    )
 
 
 def _tokenize(text):
@@ -78,7 +175,11 @@ def _tokenize(text):
     return WORD_PATTERN.findall(normalized)
 
 
-def _find_word_sequence(quote, words, blocks=None):
+def _find_word_sequence(
+    quote,
+    words,
+    blocks=None,
+):
     """Match an exact normalized quotation against native words."""
 
     quote_tokens = _tokenize(quote)
@@ -87,7 +188,8 @@ def _find_word_sequence(quote, words, blocks=None):
         return []
 
     valid_words = [
-        word for word in words
+        word
+        for word in words
         if isinstance(word, dict)
     ]
 
@@ -97,7 +199,9 @@ def _find_word_sequence(quote, words, blocks=None):
     block_order = {}
 
     if isinstance(blocks, list):
+
         for index, block in enumerate(blocks):
+
             if not isinstance(block, dict):
                 continue
 
@@ -107,12 +211,15 @@ def _find_word_sequence(quote, words, blocks=None):
                 block_order[block_id] = index
 
     def sort_key(word):
+
         block_id = word.get("block_id")
         block_no = word.get("block_no", 0)
 
         order = block_order.get(
             block_id,
-            block_no if isinstance(block_no, (int, float)) else 0,
+            block_no
+            if isinstance(block_no, (int, float))
+            else 0,
         )
 
         line_no = word.get("line_no", 0)
@@ -120,20 +227,33 @@ def _find_word_sequence(quote, words, blocks=None):
 
         return (
             order,
-            line_no if isinstance(line_no, (int, float)) else 0,
-            word_no if isinstance(word_no, (int, float)) else 0,
+            line_no
+            if isinstance(line_no, (int, float))
+            else 0,
+            word_no
+            if isinstance(word_no, (int, float))
+            else 0,
         )
 
-    ordered_words = sorted(valid_words, key=sort_key)
+    ordered_words = sorted(
+        valid_words,
+        key=sort_key,
+    )
 
     indexed_words = []
 
     for word in ordered_words:
-        for token in _tokenize(word.get("text", "")):
-            indexed_words.append((token, word))
+
+        for token in _tokenize(
+            word.get("text", "")
+        ):
+            indexed_words.append(
+                (token, word)
+            )
 
     document_tokens = [
-        token for token, _ in indexed_words
+        token
+        for token, _ in indexed_words
     ]
 
     quote_length = len(quote_tokens)
@@ -141,10 +261,14 @@ def _find_word_sequence(quote, words, blocks=None):
     for start in range(
         len(document_tokens) - quote_length + 1
     ):
+
         if (
-            document_tokens[start:start + quote_length]
+            document_tokens[
+                start:start + quote_length
+            ]
             == quote_tokens
         ):
+
             return [
                 word
                 for _, word in indexed_words[
@@ -155,7 +279,10 @@ def _find_word_sequence(quote, words, blocks=None):
     return []
 
 
-def _build_highlight_rectangles(matched_words):
+
+def _build_highlight_rectangles(
+    matched_words,
+):
     """Generate line-level highlight rectangles from native words."""
 
     if not matched_words:
@@ -164,15 +291,21 @@ def _build_highlight_rectangles(matched_words):
     grouped_lines = {}
 
     for word in matched_words:
+
         bbox = word.get("bbox")
 
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        if (
+            not isinstance(bbox, (list, tuple))
+            or len(bbox) != 4
+        ):
             return []
 
         try:
             x0, y0, x1, y1 = (
-                float(value) for value in bbox
+                float(value)
+                for value in bbox
             )
+
         except (TypeError, ValueError):
             return []
 
@@ -191,19 +324,37 @@ def _build_highlight_rectangles(matched_words):
         )
 
         if line_key not in grouped_lines:
+
             grouped_lines[line_key] = {
                 "x0": x0,
                 "y0": y0,
                 "x1": x1,
                 "y1": y1,
             }
+
         else:
+
             rectangle = grouped_lines[line_key]
 
-            rectangle["x0"] = min(rectangle["x0"], x0)
-            rectangle["y0"] = min(rectangle["y0"], y0)
-            rectangle["x1"] = max(rectangle["x1"], x1)
-            rectangle["y1"] = max(rectangle["y1"], y1)
+            rectangle["x0"] = min(
+                rectangle["x0"],
+                x0,
+            )
+
+            rectangle["y0"] = min(
+                rectangle["y0"],
+                y0,
+            )
+
+            rectangle["x1"] = max(
+                rectangle["x1"],
+                x1,
+            )
+
+            rectangle["y1"] = max(
+                rectangle["y1"],
+                y1,
+            )
 
     return [
         [
@@ -216,7 +367,10 @@ def _build_highlight_rectangles(matched_words):
     ]
 
 
-def _build_ocr_highlight_rectangles(matched_lines):
+
+def _build_ocr_highlight_rectangles(
+    matched_lines,
+):
     """Generate highlight rectangles from OCR line coordinates."""
 
     if not matched_lines:
@@ -225,18 +379,24 @@ def _build_ocr_highlight_rectangles(matched_lines):
     rectangles = []
 
     for line in matched_lines:
+
         if not isinstance(line, dict):
             continue
 
         bbox = line.get("bbox")
 
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        if (
+            not isinstance(bbox, (list, tuple))
+            or len(bbox) != 4
+        ):
             continue
 
         try:
             x0, y0, x1, y1 = (
-                float(value) for value in bbox
+                float(value)
+                for value in bbox
             )
+
         except (TypeError, ValueError):
             continue
 
@@ -259,20 +419,29 @@ def _build_ocr_highlight_rectangles(matched_lines):
     return rectangles
 
 
-def _get_matched_block_metadata(matched_words):
+def _get_matched_block_metadata(
+    matched_words,
+):
     """Extract original PDF block metadata."""
 
     block_ids = []
     block_numbers = []
 
     for word in matched_words:
+
         block_id = word.get("block_id")
         block_no = word.get("block_no")
 
-        if block_id is not None and block_id not in block_ids:
+        if (
+            block_id is not None
+            and block_id not in block_ids
+        ):
             block_ids.append(block_id)
 
-        if block_no is not None and block_no not in block_numbers:
+        if (
+            block_no is not None
+            and block_no not in block_numbers
+        ):
             block_numbers.append(block_no)
 
     return {
@@ -281,20 +450,30 @@ def _get_matched_block_metadata(matched_words):
     }
 
 
-def _get_ocr_block_metadata(matched_lines):
+
+def _get_ocr_block_metadata(
+    matched_lines,
+):
     """Extract OCR block metadata."""
 
     block_ids = []
     block_numbers = []
 
     for line in matched_lines:
+
         block_id = line.get("block_id")
         block_no = line.get("block_no")
 
-        if block_id is not None and block_id not in block_ids:
+        if (
+            block_id is not None
+            and block_id not in block_ids
+        ):
             block_ids.append(block_id)
 
-        if block_no is not None and block_no not in block_numbers:
+        if (
+            block_no is not None
+            and block_no not in block_numbers
+        ):
             block_numbers.append(block_no)
 
     return {
@@ -303,7 +482,12 @@ def _get_ocr_block_metadata(matched_lines):
     }
 
 
-def _verify_evidence(source_id, quote, citations_by_id):
+
+def _verify_evidence_impl(
+    source_id,
+    quote,
+    citations_by_id,
+):
     """Verify a quotation against its original PDF page."""
 
     citation = citations_by_id.get(source_id)
@@ -316,7 +500,10 @@ def _verify_evidence(source_id, quote, citations_by_id):
     if not quote:
         return None
 
-    page_text = citation.get("page_text", "")
+    page_text = citation.get(
+        "page_text",
+        "",
+    )
 
     normalized_quote = _normalize_text(quote)
     normalized_page_text = _normalize_text(page_text)
@@ -330,35 +517,49 @@ def _verify_evidence(source_id, quote, citations_by_id):
     quote_text = " ".join(quote_tokens)
     page_text_normalized = " ".join(page_tokens)
 
-    if not quote_text or quote_text not in page_text_normalized:
+    if (
+        not quote_text
+        or quote_text not in page_text_normalized
+    ):
+
         logger.warning(
             "[EVIDENCE DEBUG] Quote not found in page text. "
             "Source: %s, Quote: %s",
             source_id,
             normalized_quote,
         )
+
         return None
 
     extraction_source = str(
-        citation.get("extraction_source", "native")
+        citation.get(
+            "extraction_source",
+            "native",
+        )
     ).lower()
 
+
     if extraction_source == "ocr":
+
         ocr_result = find_ocr_citation_boxes(
             citation.get("lines", []),
             quote,
         )
 
         if not ocr_result.get("found"):
+
             logger.warning(
                 "[EVIDENCE DEBUG] OCR line sequence not found. "
-                "Source: %s, Quote: %s",
+                "Source: %s",
                 source_id,
-                quote,
             )
+
             return None
 
-        matched_lines = ocr_result.get("matched_lines", [])
+        matched_lines = ocr_result.get(
+            "matched_lines",
+            [],
+        )
 
         rectangles = _build_ocr_highlight_rectangles(
             matched_lines
@@ -367,9 +568,13 @@ def _verify_evidence(source_id, quote, citations_by_id):
         if not rectangles:
             return None
 
-        block_metadata = _get_ocr_block_metadata(matched_lines)
+        block_metadata = _get_ocr_block_metadata(
+            matched_lines
+        )
+
 
     else:
+
         matched_words = _find_word_sequence(
             quote,
             citation.get("words", []),
@@ -377,15 +582,18 @@ def _verify_evidence(source_id, quote, citations_by_id):
         )
 
         if not matched_words:
+
             logger.warning(
                 "[EVIDENCE DEBUG] Native word sequence "
-                "not found. Source: %s, Quote: %s",
+                "not found. Source: %s",
                 source_id,
-                quote,
             )
+
             return None
 
-        rectangles = _build_highlight_rectangles(matched_words)
+        rectangles = _build_highlight_rectangles(
+            matched_words
+        )
 
         if not rectangles:
             return None
@@ -418,7 +626,89 @@ def _verify_evidence(source_id, quote, citations_by_id):
     }
 
 
-def _clean_answer(answer, valid_source_ids):
+def _verify_evidence(
+    source_id,
+    quote,
+    citations_by_id,
+):
+    """Verify evidence and record the verification result."""
+
+    citation = citations_by_id.get(source_id)
+
+    extraction_source = (
+        citation.get("extraction_source", "native")
+        if citation
+        else "unknown"
+    )
+
+    with _start_span(
+        "citation-evidence-verification",
+        metadata={
+            "source_id": source_id,
+            "extraction_source": extraction_source,
+            "page_number": (
+                citation.get("page_number")
+                if citation
+                else None
+            ),
+        },
+    ) as observation:
+
+        if LANGFUSE_LOG_CONTENT:
+
+            _update_span(
+                observation,
+                input={
+                    "source_id": source_id,
+                    "quote": quote,
+                },
+            )
+
+        verified = _verify_evidence_impl(
+            source_id,
+            quote,
+            citations_by_id,
+        )
+
+        if verified:
+
+            output = {
+                "verified": True,
+                "source_id": source_id,
+                "page_number": verified["page_number"],
+                "filename": verified["filename"],
+                "extraction_source": verified["extraction_source"],
+                "highlight_rectangle_count": len(
+                    verified["highlight_rectangles"]
+                ),
+                "block_ids": verified["block_ids"],
+                "block_numbers": verified["block_numbers"],
+            }
+
+            if LANGFUSE_LOG_CONTENT:
+                output["verified_excerpt"] = verified["excerpt"]
+
+        else:
+
+            output = {
+                "verified": False,
+                "source_id": source_id,
+                "extraction_source": extraction_source,
+                "reason": "Quote or highlight coordinates could not be verified",
+            }
+
+        _update_span(
+            observation,
+            output=output,
+        )
+
+        return verified
+
+
+def _clean_answer(
+    answer,
+    valid_source_ids,
+):
     """Remove inline citations without verified evidence."""
 
     return SOURCE_ID_PATTERN.sub(
@@ -431,26 +721,14 @@ def _clean_answer(answer, valid_source_ids):
     ).strip()
 
 
-def generate_answer(
-    question: str,
+
+def _build_answer_context(
     retrieved_sections: list[dict],
-) -> dict:
+):
     """
-    Generate a grounded answer with verified PDF citations
-    and exact highlight coordinates using Gemini.
+    Convert retrieved sections into numbered sources
+    and construct the Gemini context.
     """
-
-    if not isinstance(question, str) or not question.strip():
-        raise ValueError("Question cannot be empty")
-
-    if not retrieved_sections:
-        return {
-            "answer": (
-                "I couldn't find relevant information "
-                "in the indexed documents."
-            ),
-            "citations": [],
-        }
 
     context_parts = []
     citations_by_id = {}
@@ -458,13 +736,28 @@ def generate_answer(
     source_number = 1
 
     for section in retrieved_sections:
-        filename = section.get("filename") or "Unknown document"
-        section_title = section.get("section_title") or "Unknown section"
-        section_document_id = section.get("document_id")
+
+        filename = (
+            section.get("filename")
+            or "Unknown document"
+        )
+
+        section_title = (
+            section.get("section_title")
+            or "Unknown section"
+        )
+
+        section_document_id = section.get(
+            "document_id"
+        )
 
         for page in section.get("pages", []):
+
             page_number = page.get("page_number")
-            page_text = (page.get("text") or "").strip()
+
+            page_text = (
+                page.get("text") or ""
+            ).strip()
 
             if not page_text or page_number is None:
                 continue
@@ -475,7 +768,10 @@ def generate_answer(
                 else page.get("document_id")
             )
 
-            page_filename = page.get("filename") or filename
+            page_filename = (
+                page.get("filename")
+                or filename
+            )
 
             page_key = (
                 str(document_id or ""),
@@ -527,7 +823,80 @@ def generate_answer(
                 f"Content:\n{page_text}"
             )
 
-    if not context_parts:
+    context = "\n\n---\n\n".join(context_parts)
+
+    return context, citations_by_id
+
+
+
+def _generate_answer_impl(
+    question: str,
+    retrieved_sections: list[dict],
+) -> dict:
+    """
+    Generate a grounded answer with verified PDF citations
+    and exact highlight coordinates.
+    """
+
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Question cannot be empty")
+
+    if not retrieved_sections:
+
+        return {
+            "answer": (
+                "I couldn't find relevant information "
+                "in the indexed documents."
+            ),
+            "citations": [],
+        }
+
+  
+
+    with _start_span(
+        "answer-context-construction",
+        metadata={
+            "retrieved_section_count": len(retrieved_sections),
+        },
+    ) as observation:
+
+        context, citations_by_id = _build_answer_context(
+            retrieved_sections
+        )
+
+        source_metadata = [
+            {
+                "source_id": source_id,
+                "filename": citation["filename"],
+                "document_id": str(citation["document_id"]),
+                "page_number": citation["page_number"],
+                "section_title": citation["section_title"],
+                "extraction_source": citation["extraction_source"],
+                "text_characters": len(citation["page_text"]),
+            }
+            for source_id, citation in citations_by_id.items()
+        ]
+
+        context_output = {
+            "source_count": len(citations_by_id),
+            "context_characters": len(context),
+            "sources": source_metadata,
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+
+            context_output["context"] = context
+
+        _update_span(
+            observation,
+            input={
+                "retrieved_section_count": len(retrieved_sections),
+            },
+            output=context_output,
+        )
+
+    if not context.strip():
+
         return {
             "answer": (
                 "Relevant sections were found, but no readable "
@@ -535,8 +904,6 @@ def generate_answer(
             ),
             "citations": [],
         }
-
-    context = "\n\n---\n\n".join(context_parts)
 
     prompt = f"""
 You are a document question-answering assistant.
@@ -591,29 +958,81 @@ DOCUMENT CONTEXT:
 Return JSON only. Do not use Markdown code fences.
 """
 
-    response = generate_content_with_retry(
-        prompt,
-        config={
-            "response_mime_type": "application/json",
-            "temperature": 0.2,
+  
+
+    with _start_span(
+        "document-answer-generation",
+        metadata={
+            "provider": "Google Gemini",
+            "source_count": len(citations_by_id),
+            "context_characters": len(context),
         },
-    )
+    ) as observation:
 
-    result = _parse_json_response(response)
+        generation_input = {
+            "question": question,
+            "source_count": len(citations_by_id),
+            "context_characters": len(context),
+        }
 
-    answer = result.get("answer", "")
+        if LANGFUSE_LOG_CONTENT:
 
-    if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("Gemini returned an empty answer")
+            generation_input["prompt"] = prompt
 
-    evidence_items = result.get("evidence", [])
+        _update_span(
+            observation,
+            input=generation_input,
+        )
 
-    if not isinstance(evidence_items, list):
-        evidence_items = []
+        response = generate_content_with_retry(
+            prompt,
+            config={
+                "response_mime_type": "application/json",
+                "temperature": 0.2,
+            },
+        )
+
+        result = _parse_json_response(response)
+
+        answer = result.get("answer", "")
+
+        if (
+            not isinstance(answer, str)
+            or not answer.strip()
+        ):
+            raise RuntimeError(
+                "Gemini returned an empty answer"
+            )
+
+        evidence_items = result.get(
+            "evidence",
+            [],
+        )
+
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+
+        generation_output = {
+            "answer_characters": len(answer),
+            "evidence_items_returned": len(evidence_items),
+            "source_ids": list(citations_by_id.keys()),
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+
+            generation_output["answer"] = answer
+            generation_output["evidence"] = evidence_items
+
+        _update_span(
+            observation,
+            output=generation_output,
+        )
+
 
     verified_evidence = {}
 
     for item in evidence_items:
+
         if not isinstance(item, dict):
             continue
 
@@ -624,6 +1043,10 @@ Return JSON only. Do not use Markdown code fences.
             not isinstance(source_id, str)
             or source_id not in citations_by_id
         ):
+            logger.warning(
+                "[EVIDENCE REJECTED] Invalid source ID: %s",
+                source_id,
+            )
             continue
 
         verified = _verify_evidence(
@@ -633,11 +1056,13 @@ Return JSON only. Do not use Markdown code fences.
         )
 
         if not verified:
+
             logger.warning(
                 "[EVIDENCE REJECTED] Source: %s, Quote: %r",
                 source_id,
                 quote,
             )
+
             continue
 
         logger.info(
@@ -646,11 +1071,15 @@ Return JSON only. Do not use Markdown code fences.
             verified["page_number"],
         )
 
-        verified_evidence.setdefault(source_id, []).append(
-            verified
-        )
+        verified_evidence.setdefault(
+            source_id,
+            [],
+        ).append(verified)
 
-    cited_ids = set(SOURCE_ID_PATTERN.findall(answer))
+
+    cited_ids = set(
+        SOURCE_ID_PATTERN.findall(answer)
+    )
 
     valid_source_ids = cited_ids.intersection(
         verified_evidence.keys()
@@ -663,11 +1092,18 @@ Return JSON only. Do not use Markdown code fences.
         sorted(valid_source_ids),
     )
 
-    answer = _clean_answer(answer, valid_source_ids)
+  
+
+    cleaned_answer = _clean_answer(
+        answer,
+        valid_source_ids,
+    )
+
 
     citations = []
 
     for source_id, citation_data in citations_by_id.items():
+
         if source_id not in valid_source_ids:
             continue
 
@@ -675,7 +1111,10 @@ Return JSON only. Do not use Markdown code fences.
         seen_quotes = set()
 
         for passage in verified_evidence[source_id]:
-            quote_key = _normalize_text(passage["excerpt"])
+
+            quote_key = _normalize_text(
+                passage["excerpt"]
+            )
 
             if quote_key in seen_quotes:
                 continue
@@ -709,7 +1148,122 @@ Return JSON only. Do not use Markdown code fences.
             "relevance_score": citation_data["relevance_score"],
         })
 
+    with _start_span(
+        "final-citation-validation",
+        metadata={
+            "generated_citations": len(cited_ids),
+            "verified_sources": len(verified_evidence),
+            "valid_citations": len(valid_source_ids),
+        },
+    ) as observation:
+
+        _update_span(
+            observation,
+            input={
+                "cited_source_ids": sorted(cited_ids),
+                "verified_source_ids": sorted(
+                    verified_evidence.keys()
+                ),
+            },
+            output={
+                "valid_source_ids": sorted(valid_source_ids),
+                "removed_source_ids": sorted(
+                    cited_ids - valid_source_ids
+                ),
+                "final_citation_count": len(citations),
+                "final_answer_characters": len(cleaned_answer),
+            },
+        )
+
     return {
-        "answer": answer,
+        "answer": cleaned_answer,
         "citations": citations,
     }
+
+
+
+def generate_answer(
+    question: str,
+    retrieved_sections: list[dict],
+) -> dict:
+    """
+    Generate a grounded answer and record the complete
+    answer-generation lifecycle in Langfuse.
+    """
+
+    section_metadata = [
+        {
+            "document_id": str(
+                section.get("document_id", "")
+            ),
+            "filename": section.get("filename"),
+            "section_id": section.get("section_id"),
+            "section_title": section.get("section_title"),
+            "page_count": len(
+                section.get("pages", [])
+            ),
+        }
+        for section in retrieved_sections
+    ]
+
+    with _start_span(
+        "pageindex-answer-generation",
+        metadata={
+            "retrieved_sections": len(retrieved_sections),
+            "retrieved_pages": sum(
+                len(section.get("pages", []))
+                for section in retrieved_sections
+            ),
+            "content_logging_enabled": LANGFUSE_LOG_CONTENT,
+        },
+    ) as observation:
+
+        input_data = {
+            "question": question,
+            "retrieved_sections": section_metadata,
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+            input_data["retrieved_content"] = retrieved_sections
+
+        _update_span(
+            observation,
+            input=input_data,
+        )
+
+        result = _generate_answer_impl(
+            question=question,
+            retrieved_sections=retrieved_sections,
+        )
+
+        output_data = {
+            "answer_characters": len(
+                result.get("answer", "")
+            ),
+            "citation_count": len(
+                result.get("citations", [])
+            ),
+            "citations": [
+                {
+                    "source_id": citation["source_id"],
+                    "filename": citation["filename"],
+                    "page_number": citation["page_number"],
+                    "extraction_source": citation["extraction_source"],
+                    "highlight_rectangle_count": len(
+                        citation.get("highlight_rectangles", [])
+                    ),
+                }
+                for citation in result.get("citations", [])
+            ],
+        }
+
+        if LANGFUSE_LOG_CONTENT:
+            output_data["answer"] = result.get("answer")
+            output_data["full_citations"] = result.get("citations")
+
+        _update_span(
+            observation,
+            output=output_data,
+        )
+
+        return result

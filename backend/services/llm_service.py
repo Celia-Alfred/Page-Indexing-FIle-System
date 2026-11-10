@@ -5,6 +5,7 @@ import time
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import httpx
 from dotenv import load_dotenv
@@ -14,12 +15,39 @@ from google.genai import errors, types
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+logger = logging.getLogger(__name__)
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-2.5-flash",
 ).strip()
+
+LANGFUSE_ENABLED = (
+    os.getenv("LANGFUSE_ENABLED", "false").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+LANGFUSE_LOG_CONTENT = (
+    os.getenv("LANGFUSE_LOG_CONTENT", "false").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+langfuse = None
+
+if LANGFUSE_ENABLED:
+    try:
+        from langfuse import get_client
+
+        langfuse = get_client()
+        logger.info("Langfuse Gemini generation tracing initialized")
+
+    except Exception:
+        logger.exception(
+            "Could not initialize Langfuse. "
+            "Gemini will continue without generation tracing."
+        )
 
 if not GEMINI_API_KEY:
     raise ValueError(
@@ -53,9 +81,6 @@ NETWORK_EXCEPTIONS = (
     TimeoutError,
 )
 
-logger = logging.getLogger(__name__)
-
-
 
 def _get_status_code(exc: Exception):
     """Safely extract an HTTP status code from a Gemini API error."""
@@ -83,6 +108,142 @@ def _get_retry_delay(
     return RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
 
 
+def _get_usage_details(response) -> dict:
+    """Extract token usage from Gemini response metadata."""
+
+    usage = getattr(response, "usage_metadata", None)
+
+    if not usage:
+        return {}
+
+    prompt_tokens = getattr(
+        usage,
+        "prompt_token_count",
+        None,
+    )
+
+    output_tokens = getattr(
+        usage,
+        "candidates_token_count",
+        None,
+    )
+
+    total_tokens = getattr(
+        usage,
+        "total_token_count",
+        None,
+    )
+
+    usage_details = {}
+
+    if prompt_tokens is not None:
+        usage_details["input"] = prompt_tokens
+
+    if output_tokens is not None:
+        usage_details["output"] = output_tokens
+
+    if total_tokens is not None:
+        usage_details["total"] = total_tokens
+
+    return usage_details
+
+
+def _start_gemini_generation(
+    contents: str,
+    generation_config: dict,
+    attempt: int,
+):
+    """
+    Start a Langfuse Generation observation.
+
+    Each Gemini API attempt gets its own Generation observation.
+    """
+
+    if not langfuse:
+        return nullcontext(None)
+
+    try:
+        observation_input = (
+            contents
+            if LANGFUSE_LOG_CONTENT
+            else {
+                "prompt_characters": len(contents),
+                "content_logging": "disabled",
+            }
+        )
+
+        return langfuse.start_as_current_observation(
+            as_type="generation",
+            name="gemini-generate-content",
+            model=GEMINI_MODEL,
+            input=observation_input,
+            metadata={
+                "provider": "Google Gemini",
+                "model": GEMINI_MODEL,
+                "attempt": attempt + 1,
+                "max_attempts": MAX_ATTEMPTS,
+                "generation_config_fields": list(
+                    generation_config.keys()
+                ),
+                "content_logging": LANGFUSE_LOG_CONTENT,
+            },
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not start Langfuse Gemini generation observation"
+        )
+        return nullcontext(None)
+
+
+def _update_generation(
+    observation,
+    response=None,
+    generated_text: str | None = None,
+    error: Exception | None = None,
+):
+    """Safely update Langfuse with Gemini response details."""
+
+    if observation is None:
+        return
+
+    try:
+        if error is not None:
+            observation.update(
+                level="ERROR",
+                status_message=str(error),
+                output={
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+            )
+            return
+
+        output = (
+            generated_text
+            if LANGFUSE_LOG_CONTENT
+            else {
+                "response_characters": len(generated_text or ""),
+                "content_logging": "disabled",
+            }
+        )
+
+        update_data = {
+            "output": output,
+        }
+
+        usage_details = _get_usage_details(response)
+
+        if usage_details:
+            update_data["usage_details"] = usage_details
+
+        observation.update(**update_data)
+
+    except Exception:
+        logger.exception(
+            "Could not update Langfuse Gemini generation observation"
+        )
+
 
 def generate_content_with_retry(
     contents: str,
@@ -91,13 +252,8 @@ def generate_content_with_retry(
     """
     Generate content using Google Gemini.
 
-    Retries:
-    - HTTP 408
-    - HTTP 429
-    - HTTP 500, 502, 503, 504
-    - Network connection failures
-    - Connection timeouts
-    - Remote protocol errors
+    Each API attempt is independently recorded as a Langfuse
+    Generation observation when Langfuse is enabled.
 
     Returns a response object with:
     - response.text
@@ -144,20 +300,40 @@ def generate_content_with_retry(
                 MAX_ATTEMPTS,
             )
 
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=gemini_config,
-            )
+            with _start_gemini_generation(
+                contents,
+                generation_config,
+                attempt,
+            ) as generation:
 
-            generated_text = (
-                getattr(response, "text", None) or ""
-            ).strip()
+                try:
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=contents,
+                        config=gemini_config,
+                    )
 
-            if not generated_text:
-                raise RuntimeError(
-                    "Gemini returned an empty response"
-                )
+                    generated_text = (
+                        getattr(response, "text", None) or ""
+                    ).strip()
+
+                    if not generated_text:
+                        raise RuntimeError(
+                            "Gemini returned an empty response"
+                        )
+
+                    _update_generation(
+                        generation,
+                        response=response,
+                        generated_text=generated_text,
+                    )
+
+                except Exception as exc:
+                    _update_generation(
+                        generation,
+                        error=exc,
+                    )
+                    raise
 
             logger.info("Gemini response received successfully")
 
@@ -165,8 +341,6 @@ def generate_content_with_retry(
                 text=generated_text,
                 raw_response=response,
             )
-
-
 
         except errors.APIError as exc:
 
@@ -202,8 +376,6 @@ def generate_content_with_retry(
 
             time.sleep(delay)
 
-
-
         except NETWORK_EXCEPTIONS as exc:
 
             if attempt == MAX_ATTEMPTS - 1:
@@ -226,7 +398,6 @@ def generate_content_with_retry(
 
             time.sleep(delay)
 
-
         except Exception:
             logger.exception(
                 "Unexpected error while generating "
@@ -237,8 +408,6 @@ def generate_content_with_retry(
     raise RuntimeError(
         "Gemini request failed after all retry attempts"
     )
-
-
 
 
 def generate_summary(text: str) -> str:
@@ -276,7 +445,6 @@ DOCUMENT SECTION:
         )
 
     return summary
-
 
 
 def understand_query(question: str) -> dict:
